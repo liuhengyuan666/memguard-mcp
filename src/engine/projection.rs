@@ -1,5 +1,6 @@
 use crate::models::*;
 use anyhow::{anyhow, Result};
+use regex::Regex;
 
 // ── context.md ↔ RuntimeState ──────────────────────────────────────────────
 
@@ -11,8 +12,8 @@ use anyhow::{anyhow, Result};
 /// {phase}
 ///
 /// # Active Tasks
-/// - [Todo] {description}
-/// - [InProgress|Done] {description}
+/// - [Todo] [TASK-XXX] {description}
+/// - [InProgress|Done] [TASK-XXX] {description}
 ///
 /// # Constraints
 /// - {constraint}
@@ -78,7 +79,7 @@ pub fn render_context(state: &RuntimeState) -> String {
                 TaskStatus::InProgress => "InProgress",
                 TaskStatus::Done => "Done",
             };
-            md.push_str(&format!("- [{}] {}\n", status, task.description));
+            md.push_str(&format!("- [{}] [{}] {}\n", status, task.id, task.description));
         }
         md.push('\n');
     }
@@ -378,9 +379,13 @@ fn extract_section_body(rest: &str) -> String {
         .join(" ")
 }
 
-/// Parse lines like `- [Todo] description` into a Vec<Task>.
-/// Task IDs are generated sequentially as TASK-000, TASK-001, etc.
+/// Parse lines like `- [Todo] [TASK-XXX] description` or `- [Todo] description` into a Vec<Task>.
+/// Task IDs are extracted from the markdown if present, otherwise generated sequentially.
 fn parse_task_lines(rest: &str) -> Vec<Task> {
+    static TASK_LINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^-\s*\[(Todo|InProgress|Done)\]\s*(?:\[(TASK-\d{3})\]\s*)?(.*)").unwrap()
+    });
+
     let mut tasks = Vec::new();
 
     for line in rest.lines() {
@@ -388,9 +393,14 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
         if line.is_empty() {
             continue;
         }
-        // Match: "- [Todo] description" or "- [InProgress] description" or "- [Done] description"
-        let body = line.trim_start_matches('-').trim();
-        if let Some((status_str, desc)) = parse_checkbox(body) {
+        if let Some(caps) = TASK_LINE_RE.captures(line) {
+            let status_str = &caps[1];
+            let id = caps
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| format!("TASK-{:03}", tasks.len()));
+            let desc = caps[3].trim().to_string();
+
             let status = match status_str {
                 "Todo" => TaskStatus::Todo,
                 "InProgress" => TaskStatus::InProgress,
@@ -398,23 +408,14 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                 _ => continue,
             };
             tasks.push(Task {
-                id: format!("TASK-{:03}", tasks.len()),
-                description: desc.to_string(),
+                id,
+                description: desc,
                 status,
             });
         }
     }
 
     tasks
-}
-
-/// Parse `[Todo|InProgress|Done] description` → (status, description).
-fn parse_checkbox(body: &str) -> Option<(&str, &str)> {
-    let body = body.strip_prefix('[')?;
-    let closing = body.find(']')?;
-    let status = &body[..closing];
-    let desc = body[closing + 1..].trim();
-    Some((status, desc))
 }
 
 /// Parse bullet-list lines (starting with `- `) into a Vec<String>.
