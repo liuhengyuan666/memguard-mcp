@@ -71,6 +71,9 @@ impl McpServer {
             .context("Bootstrap failed")?;
         eprintln!("[memguard] Runtime state bootstrapped.");
 
+        // TODO(Robustness): Current stdio transport assumes strict JSON-Lines (newline delimited).
+        // If the MCP client sends LSP-style headers (e.g., Content-Length: \r\n\r\n),
+        // this lines() iterator will fail. Upgrade to a length-prefixed buffer reader if needed.
         while let Some(line) = lines
             .next_line()
             .await
@@ -84,6 +87,13 @@ impl McpServer {
             let req: JsonRpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
+                    // Filter out non-JSON transport headers (LSP-style, HTTP-style).
+                    if line.starts_with("Content-Length:")
+                        || line.starts_with("Content-Type:")
+                        || line.trim().is_empty()
+                    {
+                        continue; // silently skip transport headers
+                    }
                     let err_resp = JsonRpcResponse {
                         jsonrpc: "2.0",
                         id: None,
