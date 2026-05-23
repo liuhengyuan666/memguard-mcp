@@ -29,6 +29,54 @@ pub struct StateManager {
     traps_ok: Arc<AtomicBool>,
 }
 
+// ── ADR Conflict Detection ────────────────────────────────────────────────
+
+/// Compute a content hash for an ADR based on its title and decision fields.
+fn content_hash(adr: &ADR) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    adr.title.trim().to_lowercase().hash(&mut h);
+    adr.decision.trim().to_lowercase().hash(&mut h);
+    h.finish()
+}
+
+/// Structured error variants for ADR conflict detection.
+#[derive(Debug)]
+pub enum AdrError {
+    ActiveConflict {
+        id: String,
+        existing_title: String,
+        new_title: String,
+    },
+    RejectedRepeat {
+        id: String,
+    },
+}
+
+impl std::fmt::Display for AdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdrError::ActiveConflict {
+                id,
+                existing_title,
+                new_title,
+            } => write!(
+                f,
+                "[CONFLICT] ADR {} conflict: an active ADR with this id already exists with different content. Existing title: \"{}\", New title: \"{}\"",
+                id, existing_title, new_title
+            ),
+            AdrError::RejectedRepeat { id } => write!(
+                f,
+                "[CONFLICT] ADR {} was previously rejected with the same decision content. To re-submit, explain what material conditions have changed in the context field.",
+                id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdrError {}
+
 impl StateManager {
     /// Create a new StateManager, spawn the debounced flush background task.
     pub fn new(project_root: PathBuf) -> Self {
@@ -285,10 +333,40 @@ impl StateManager {
 
             RuntimeEvent::AdrCommitted(adr) => {
                 let mut decisions = self.decisions.write().await;
-                // Supersede any existing ADR with the same id.
-                if let Some(existing) =
-                    decisions.iter_mut().find(|a| a.id == adr.id)
-                {
+                let new_hash = content_hash(&adr);
+
+                // Check for existing ADR with the same id.
+                if let Some(existing) = decisions.iter().find(|a| a.id == adr.id) {
+                    let existing_hash = content_hash(existing);
+
+                    match existing.status.as_str() {
+                        "active" => {
+                            if new_hash == existing_hash {
+                                // Idempotent: same content, silently ignore.
+                                drop(decisions);
+                                let _ = self.flush_tx.send(());
+                                return Ok(());
+                            }
+                            return Err(AdrError::ActiveConflict {
+                                id: adr.id,
+                                existing_title: existing.title.clone(),
+                                new_title: adr.title,
+                            }
+                            .into());
+                        }
+                        "rejected" => {
+                            if new_hash == existing_hash {
+                                return Err(AdrError::RejectedRepeat { id: adr.id }.into());
+                            }
+                            // Different content: allow (fall through to supersede + push).
+                        }
+                        // superseded, deprecated, conflict, or any other status: allow.
+                        _ => {}
+                    }
+                }
+
+                // No conflict: mark all existing versions as superseded, then push new.
+                for existing in decisions.iter_mut().filter(|a| a.id == adr.id) {
                     existing.status = "superseded".to_string();
                 }
                 let mut adr = adr;
@@ -360,6 +438,7 @@ impl StateManager {
                     serde_json::json!({
                         "id": a.id,
                         "title": a.title,
+                        "status": a.status,
                         "tags": a.tags,
                     })
                 })
@@ -440,8 +519,8 @@ async fn load_state_from_disk(
     }
 
     let mut context_parsed = false;
-    let mut decisions_parsed = false;
     let mut traps_parsed = false;
+    let decisions_parsed;
 
     // ── Load context.md ─────────────────────────────────────────
     let state = {
@@ -485,25 +564,62 @@ async fn load_state_from_disk(
         }
     };
 
-    // ── Load decisions.md ───────────────────────────────────────
-    let decisions = {
-        let dec_path = memory_dir.join("decisions.md");
-        if tokio::fs::try_exists(&dec_path)
+    // ── Load decisions.md + decisions_archive.md ────────────────
+    let mut decisions = Vec::new();
+    let mut main_parsed = false;
+    let mut archive_parsed = false;
+
+    let dec_path = memory_dir.join("decisions.md");
+    if tokio::fs::try_exists(&dec_path)
+        .await
+        .context("Failed to check memory/decisions.md existence")?
+    {
+        let content = tokio::fs::read_to_string(&dec_path)
             .await
-            .context("Failed to check memory/decisions.md existence")?
-        {
-            let content = tokio::fs::read_to_string(&dec_path)
-                .await
-                .context("Failed to read memory/decisions.md")?;
-            projection::parse_decisions(&content)
-                .context("Failed to parse memory/decisions.md")?
-        } else {
-            Vec::new()
+            .context("Failed to read memory/decisions.md")?;
+        match projection::parse_decisions(&content) {
+            Ok(mut adrs) => {
+                main_parsed = true;
+                decisions.append(&mut adrs);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[memguard] WARNING: failed to parse memory/decisions.md (old format?): {}",
+                    e
+                );
+                eprintln!(
+                    "[memguard] The file is preserved as-is. To migrate: have the LLM read the old file,",
+                );
+                eprintln!(
+                    "[memguard] convert content to new format, and write it back. Then re-run bootstrap.",
+                );
+            }
         }
-    };
-    if !decisions.is_empty() {
-        decisions_parsed = true;
     }
+
+    let archive_path = memory_dir.join("decisions_archive.md");
+    if tokio::fs::try_exists(&archive_path)
+        .await
+        .context("Failed to check memory/decisions_archive.md existence")?
+    {
+        let content = tokio::fs::read_to_string(&archive_path)
+            .await
+            .context("Failed to read memory/decisions_archive.md")?;
+        match projection::parse_decisions(&content) {
+            Ok(mut adrs) => {
+                archive_parsed = true;
+                decisions.append(&mut adrs);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[memguard] WARNING: failed to parse memory/decisions_archive.md (old format?): {}",
+                    e
+                );
+            }
+        }
+    }
+
+    decisions_parsed = main_parsed || archive_parsed;
 
     // ── Load traps.md ───────────────────────────────────────────
     let traps = {
@@ -591,18 +707,35 @@ async fn flush_inner(
         }
     }
 
-    // decisions.md
+    // decisions.md + decisions_archive.md
     {
         let d = decisions.read().await;
-        let rendered = projection::render_decisions(&d);
+        let (active_adrs, stale_adrs): (Vec<ADR>, Vec<ADR>) =
+            d.iter().cloned().partition(|adr| adr.status == "active");
+
+        let mut active_rendered = String::new();
+        if !stale_adrs.is_empty() {
+            active_rendered.push_str("> Historical decisions are in [decisions_archive.md](./decisions_archive.md)\n\n");
+        }
+        active_rendered.push_str(&projection::render_decisions(&active_adrs));
+
         if !decisions_ok.load(Ordering::Acquire) && d.is_empty() {
             eprintln!(
                 "[memguard] Skipping decisions.md flush — file was not successfully parsed and decisions are empty. Old content preserved."
             );
         } else if let Err(e) =
-            tokio::fs::write(memory_dir.join("decisions.md"), &rendered).await
+            tokio::fs::write(memory_dir.join("decisions.md"), &active_rendered).await
         {
             errors.push(format!("memory/decisions.md: {}", e));
+        }
+
+        if !stale_adrs.is_empty() {
+            let stale_rendered = projection::render_decisions(&stale_adrs);
+            if let Err(e) =
+                tokio::fs::write(memory_dir.join("decisions_archive.md"), &stale_rendered).await
+            {
+                errors.push(format!("memory/decisions_archive.md: {}", e));
+            }
         }
     }
 
@@ -654,6 +787,7 @@ async fn flush_inner(
                 serde_json::json!({
                     "id": a.id,
                     "title": a.title,
+                    "status": a.status,
                     "tags": a.tags,
                 })
             })
@@ -832,15 +966,12 @@ mod tests {
             tags: vec![],
         };
 
-        mgr.apply_event(RuntimeEvent::AdrCommitted(adr2))
-            .await
-            .unwrap();
-
-        let decisions = mgr.decisions.read().await;
-        assert_eq!(decisions.len(), 2);
-        assert_eq!(decisions[0].status, "superseded");
-        assert_eq!(decisions[1].status, "active");
-        assert_eq!(decisions[1].title, "Second");
+        // Same id with different content now triggers a conflict error.
+        let result = mgr.apply_event(RuntimeEvent::AdrCommitted(adr2)).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("[CONFLICT]"));
+        assert!(err_msg.contains("ADR-001"));
     }
 
     #[tokio::test]
@@ -907,5 +1038,312 @@ mod tests {
         assert!(content.contains("testing"));
         assert!(content.contains("Flush test"));
         assert!(content.contains("Must flush correctly"));
+    }
+
+    #[tokio::test]
+    async fn test_adr_conflict_active_different_content() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        let adr1 = ADR {
+            id: "ADR-001".into(),
+            title: "Use Postgres".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use Postgres for persistence".into(),
+            tags: vec![],
+        };
+        mgr.apply_event(RuntimeEvent::AdrCommitted(adr1))
+            .await
+            .unwrap();
+
+        let adr2 = ADR {
+            id: "ADR-001".into(),
+            title: "Use SQLite".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use SQLite for persistence".into(),
+            tags: vec![],
+        };
+        let result = mgr.apply_event(RuntimeEvent::AdrCommitted(adr2)).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("[CONFLICT]"));
+        assert!(err_msg.contains("ADR-001"));
+    }
+
+    #[tokio::test]
+    async fn test_adr_idempotent_same_content() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        let adr1 = ADR {
+            id: "ADR-001".into(),
+            title: "Use Postgres".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use Postgres for persistence".into(),
+            tags: vec![],
+        };
+        mgr.apply_event(RuntimeEvent::AdrCommitted(adr1))
+            .await
+            .unwrap();
+
+        let adr2 = ADR {
+            id: "ADR-001".into(),
+            title: "Use Postgres".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use Postgres for persistence".into(),
+            tags: vec![],
+        };
+        mgr.apply_event(RuntimeEvent::AdrCommitted(adr2))
+            .await
+            .unwrap();
+
+        let decisions = mgr.decisions.read().await;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn test_adr_rejected_repeat() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Use Cassandra".into(),
+                status: "rejected".into(),
+                context: "".into(),
+                decision: "Use Cassandra for persistence".into(),
+                tags: vec![],
+            });
+        }
+
+        let adr = ADR {
+            id: "ADR-001".into(),
+            title: "Use Cassandra".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use Cassandra for persistence".into(),
+            tags: vec![],
+        };
+        let result = mgr.apply_event(RuntimeEvent::AdrCommitted(adr)).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("[CONFLICT]"));
+        assert!(err_msg.contains("rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_adr_rejected_different_content_allowed() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Use Cassandra".into(),
+                status: "rejected".into(),
+                context: "".into(),
+                decision: "Use Cassandra for persistence".into(),
+                tags: vec![],
+            });
+        }
+
+        let adr = ADR {
+            id: "ADR-001".into(),
+            title: "Use Cassandra with Sharding".into(),
+            status: "".into(),
+            context: "New scaling requirements".into(),
+            decision: "Use Cassandra with consistent hashing".into(),
+            tags: vec![],
+        };
+        mgr.apply_event(RuntimeEvent::AdrCommitted(adr))
+            .await
+            .unwrap();
+
+        let decisions = mgr.decisions.read().await;
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].status, "superseded");
+        assert_eq!(decisions[1].status, "active");
+        assert_eq!(decisions[1].title, "Use Cassandra with Sharding");
+    }
+
+    #[tokio::test]
+    async fn test_adr_superseded_allowed() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Use MySQL".into(),
+                status: "superseded".into(),
+                context: "".into(),
+                decision: "Use MySQL for persistence".into(),
+                tags: vec![],
+            });
+        }
+
+        let adr = ADR {
+            id: "ADR-001".into(),
+            title: "Use Postgres".into(),
+            status: "".into(),
+            context: "".into(),
+            decision: "Use Postgres for persistence".into(),
+            tags: vec![],
+        };
+        mgr.apply_event(RuntimeEvent::AdrCommitted(adr))
+            .await
+            .unwrap();
+
+        let decisions = mgr.decisions.read().await;
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].status, "superseded");
+        assert_eq!(decisions[1].status, "active");
+        assert_eq!(decisions[1].title, "Use Postgres");
+    }
+
+    #[tokio::test]
+    async fn test_flush_partitions_stale_adrs() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Active Choice".into(),
+                status: "active".into(),
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec!["a".into()],
+            });
+            decisions.push(ADR {
+                id: "ADR-002".into(),
+                title: "Superseded Choice".into(),
+                status: "superseded".into(),
+                context: "ctx2".into(),
+                decision: "dec2".into(),
+                tags: vec![],
+            });
+            decisions.push(ADR {
+                id: "ADR-003".into(),
+                title: "Rejected Choice".into(),
+                status: "rejected".into(),
+                context: "ctx3".into(),
+                decision: "dec3".into(),
+                tags: vec![],
+            });
+        }
+
+        mgr.flush_now().await.expect("flush should succeed");
+
+        let project_root = mgr.project_root.read().await.clone();
+        let memory_dir = project_root.join("memory");
+
+        let dec_content = tokio::fs::read_to_string(memory_dir.join("decisions.md"))
+            .await
+            .unwrap();
+        let archive_content =
+            tokio::fs::read_to_string(memory_dir.join("decisions_archive.md"))
+                .await
+                .unwrap();
+
+        // decisions.md should reference archive and contain only active ADRs
+        assert!(dec_content.contains("> Historical decisions are in [decisions_archive.md](./decisions_archive.md)"));
+        assert!(dec_content.contains("## ADR-001: Active Choice"));
+        assert!(!dec_content.contains("## ADR-002:"));
+        assert!(!dec_content.contains("## ADR-003:"));
+
+        // archive should contain stale ADRs
+        assert!(archive_content.contains("## ADR-002: Superseded Choice"));
+        assert!(archive_content.contains("## ADR-003: Rejected Choice"));
+        assert!(!archive_content.contains("## ADR-001:"));
+
+        // parse round-trip
+        let active_parsed = projection::parse_decisions(&dec_content).unwrap();
+        let stale_parsed = projection::parse_decisions(&archive_content).unwrap();
+        assert_eq!(active_parsed.len(), 1);
+        assert_eq!(active_parsed[0].id, "ADR-001");
+        assert_eq!(stale_parsed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_merges_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory_dir = dir.path().join("memory");
+        tokio::fs::create_dir_all(&memory_dir).await.unwrap();
+
+        let active_md = r##"## ADR-001: Active Choice
+
+**Status:** active
+
+### Context
+ctx
+
+### Decision
+dec
+
+**Tags:** a
+"##;
+        let archive_md = r##"## ADR-002: Old Choice
+
+**Status:** superseded
+
+### Context
+old ctx
+
+### Decision
+old dec
+"##;
+
+        tokio::fs::write(memory_dir.join("decisions.md"), active_md)
+            .await
+            .unwrap();
+        tokio::fs::write(memory_dir.join("decisions_archive.md"), archive_md)
+            .await
+            .unwrap();
+
+        let mgr = StateManager::new(dir.path().to_path_buf());
+        mgr.bootstrap().await.expect("bootstrap should succeed");
+
+        let decisions = mgr.decisions.read().await;
+        assert_eq!(decisions.len(), 2);
+        let ids: Vec<&str> = decisions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"ADR-001"));
+        assert!(ids.contains(&"ADR-002"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_not_created_when_empty() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Only Active".into(),
+                status: "active".into(),
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            });
+        }
+
+        mgr.flush_now().await.expect("flush should succeed");
+
+        let project_root = mgr.project_root.read().await.clone();
+        let memory_dir = project_root.join("memory");
+
+        assert!(memory_dir.join("decisions.md").exists());
+        assert!(!memory_dir.join("decisions_archive.md").exists());
     }
 }
