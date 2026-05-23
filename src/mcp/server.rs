@@ -1,8 +1,9 @@
-use crate::engine::state_manager::StateManager;
+use crate::engine::state_manager::{AdrError, StateManager};
 use crate::models::{RuntimeEvent, TaskStatus};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -340,6 +341,11 @@ impl McpServer {
                                 "type": "integer",
                                 "default": 3,
                                 "description": "Max number of results"
+                            },
+                            "include_stale": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Include superseded/deprecated/rejected ADRs in search results"
                             }
                         },
                         "required": ["query_intent"]
@@ -465,17 +471,53 @@ impl McpServer {
 
         let event = parse_event(event_type, payload)?;
 
-        self.state_manager
-            .apply_event(event)
-            .await
-            .map_err(|e| McpError::Internal(format!("State update failed: {}", e)))?;
-
-        Ok(serde_json::json!({
-            "content": [{
-                "type": "text",
-                "text": "Event successfully committed to runtime state."
-            }]
-        }))
+        match self.state_manager.apply_event(event).await {
+            Ok(()) => Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Event successfully committed to runtime state."
+                }]
+            })),
+            Err(ref e) if e.to_string().starts_with("[CONFLICT]") => {
+                let conflict_json = if let Some(adr_err) = e.downcast_ref::<AdrError>() {
+                    match adr_err {
+                        AdrError::ActiveConflict { id, existing_title, new_title } => {
+                            serde_json::json!({
+                                "error": "conflict",
+                                "adr_id": id,
+                                "reason": "active_conflict",
+                                "existing_title": existing_title,
+                                "new_title": new_title,
+                                "suggestion": "Re-read current ADR state. To supersede: first submit a PhaseChanged or use a new ADR id."
+                            })
+                        }
+                        AdrError::RejectedRepeat { id } => {
+                            serde_json::json!({
+                                "error": "conflict",
+                                "adr_id": id,
+                                "reason": "rejected_repeat",
+                                "existing_title": "",
+                                "new_title": "",
+                                "suggestion": "To re-submit, explain what material conditions have changed in the context field."
+                            })
+                        }
+                    }
+                } else {
+                    serde_json::json!({
+                        "error": "conflict",
+                        "message": e.to_string()
+                    })
+                };
+                Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&conflict_json).unwrap_or_default()
+                    }],
+                    "isError": true
+                }))
+            }
+            Err(e) => Err(McpError::Internal(format!("State update failed: {}", e))),
+        }
     }
 
     /// runtime_query_memory: keyword search over ADRs and Traps.
@@ -494,25 +536,33 @@ impl McpServer {
             .max(1)
             .min(20) as usize;
 
+        let include_stale = args["include_stale"].as_bool().unwrap_or(false);
+
         let decisions = self.state_manager.decisions.read().await;
         let traps = self.state_manager.traps.read().await;
 
-        // Score each item by keyword match count.
-        let mut results: Vec<(i32, Value)> = Vec::new();
+        // Score each item by hybrid fuzzy match.
+        let mut results: Vec<(f64, Value)> = Vec::new();
 
         for adr in decisions.iter() {
-            let score = score_match(
+            // P1-D: skip stale ADRs unless explicitly requested.
+            if adr.status != "active" && adr.status != "proposed" && !include_stale {
+                continue;
+            }
+
+            let score = score_match_v3(
                 &query,
                 &[
-                    &adr.title,
-                    &adr.context,
-                    &adr.decision,
-                    &adr.tags.join(" "),
+                    (10.0, &adr.title),
+                    (2.0, &adr.context),
+                    (4.0, &adr.decision),
+                    (6.0, &adr.tags.join(" ")),
                 ],
             );
-            if score > 0 {
+            if score > 0.0 {
+                let final_score = if adr.status != "active" && adr.status != "proposed" { score * 0.3 } else { score };
                 results.push((
-                    score,
+                    final_score,
                     serde_json::json!({
                         "type": "ADR",
                         "id": adr.id,
@@ -526,15 +576,15 @@ impl McpServer {
         }
 
         for trap in traps.iter() {
-            let score = score_match(
+            let score = score_match_v3(
                 &query,
                 &[
-                    &trap.error_signature,
-                    &trap.context,
-                    &trap.solution,
+                    (10.0, &trap.error_signature),
+                    (2.0, &trap.context),
+                    (4.0, &trap.solution),
                 ],
             );
-            if score > 0 {
+            if score > 0.0 {
                 results.push((
                     score,
                     serde_json::json!({
@@ -547,7 +597,7 @@ impl McpServer {
         }
 
         // Sort by score descending, take top `limit`.
-        results.sort_by_key(|(score, _)| -score);
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
 
         let items: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
@@ -653,6 +703,83 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+// ── C3: N-Gram Hybrid Fuzzy Scoring ───────────────────────────────────────
+
+const JACCARD_FUZZY_THRESHOLD: f64 = 0.25;
+const FUZZY_WEIGHT_FACTOR: f64 = 0.25;
+
+/// Check if `word` appears as a whole token in `text`, case-insensitive.
+/// Splits on non-alphanumeric boundaries, handling snake_case, kebab-case,
+/// and camelCase sub-words (e.g. "LoginScreen" splits into ["Login", "Screen"]).
+#[inline]
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|w| {
+            let wl = w.to_lowercase();
+            wl == word || wl.starts_with(word)
+        })
+}
+
+/// Compute Jaccard similarity between two strings using character n-grams.
+/// Returns [0.0, 1.0]. n=3 (trigram) is the default.
+fn ngram_jaccard(a: &str, b: &str, n: usize) -> f64 {
+    if a.len() < n || b.len() < n {
+        let al = a.to_lowercase();
+        let bl = b.to_lowercase();
+        return if al.contains(&bl) || bl.contains(&al) { 0.5 } else { 0.0 };
+    }
+
+    let ngrams_a: HashSet<&[u8]> = a.as_bytes().windows(n).collect();
+    let ngrams_b: HashSet<&[u8]> = b.as_bytes().windows(n).collect();
+
+    let intersection = ngrams_a.intersection(&ngrams_b).count();
+    let union = ngrams_a.len() + ngrams_b.len() - intersection;
+
+    if union == 0 {
+        0.0
+    } else {
+        // Use Dice coefficient for stronger recall on short tokens.
+        2.0 * intersection as f64 / (ngrams_a.len() + ngrams_b.len()) as f64
+    }
+}
+
+/// Hybrid scoring: exact word-boundary (precision) + trigram Jaccard (recall).
+/// Score = sum(weight * exact_hit) + sum(weight * 0.25 * jaccard if jaccard > threshold)
+fn score_match_v3(query: &str, fields: &[(f64, &str)]) -> f64 {
+    if query.is_empty() {
+        return 0.0;
+    }
+
+    let query_lower = query.to_lowercase();
+    let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut total: f64 = 0.0;
+
+    for &(weight, field) in fields {
+        let field_lower = field.to_lowercase();
+
+        for token in &tokens {
+            // 1. Exact word-boundary match (high precision)
+            if contains_word(&field_lower, token) {
+                total += weight;
+                continue; // do not double-count fuzzy for exact hits
+            }
+
+            // 2. Fuzzy n-gram match (high recall)
+            let jaccard = ngram_jaccard(token, &field_lower, 3);
+            if jaccard > JACCARD_FUZZY_THRESHOLD {
+                total += weight * FUZZY_WEIGHT_FACTOR * jaccard;
+            }
+        }
+
+        // 3. Exact phrase bonus (full query appears as substring)
+        if tokens.len() >= 2 && field_lower.contains(&query_lower) {
+            total += weight * 0.5;
+        }
+    }
+
+    total
+}
+
 // ── Error Type ────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -680,25 +807,73 @@ impl std::error::Error for McpError {}
 mod tests {
     use super::*;
 
+    // ── Migrated legacy tests (score_match_v3 equivalent semantics) ─────────
+
     #[test]
     fn test_score_match_exact() {
-        let s = score_match("auth token", &["Authentication token validation"]);
-        assert_eq!(s, 2);
+        let s = score_match_v3("auth token", &[(1.0, "Authentication token validation")]);
+        assert_eq!(s, 2.0);
     }
 
     #[test]
     fn test_score_match_no_match() {
-        let s = score_match("database", &["HTTP routing"]);
-        assert_eq!(s, 0);
+        let s = score_match_v3("database", &[(1.0, "HTTP routing")]);
+        assert_eq!(s, 0.0);
     }
 
     #[test]
     fn test_score_match_partial() {
-        let s = score_match(
+        let s = score_match_v3(
             "login page",
-            &["Implement user authentication and login flow"],
+            &[(1.0, "Implement user authentication and login flow")],
         );
-        assert_eq!(s, 1); // "login" matches
+        assert_eq!(s, 1.0); // "login" matches
+    }
+
+    // ── C3-specific new tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_contains_word_exact() {
+        assert!(contains_word("Authentication token validation", "auth"));
+    }
+
+    #[test]
+    fn test_contains_word_no_false_positive() {
+        assert!(!contains_word("partition", "art"));
+    }
+
+    #[test]
+    fn test_ngram_jaccard_fuzzy_match() {
+        let j = ngram_jaccard("auth", "authentication", 3);
+        assert!(j > 0.25, "expected fuzzy match > 0.25, got {}", j);
+    }
+
+    #[test]
+    fn test_ngram_jaccard_no_false_match() {
+        let j = ngram_jaccard("database", "authentication", 3);
+        assert_eq!(j, 0.0);
+    }
+
+    #[test]
+    fn test_score_v3_exact_ranks_above_fuzzy() {
+        let exact = score_match_v3("auth", &[(10.0, "auth module")]);
+        let fuzzy = score_match_v3("auth", &[(10.0, "unauthorized access")]);
+        assert!(
+            exact > fuzzy,
+            "exact match ({}) should score higher than fuzzy match ({})",
+            exact,
+            fuzzy
+        );
+    }
+
+    #[test]
+    fn test_score_v3_phrase_bonus() {
+        let with_phrase = score_match_v3("auth token", &[(10.0, "auth token validation")]);
+        let without_phrase = score_match_v3("auth token", &[(10.0, "auth and token validation")]);
+        assert!(
+            with_phrase > without_phrase,
+            "phrase bonus should make contiguous match score higher"
+        );
     }
 
     #[test]
@@ -741,5 +916,119 @@ mod tests {
         let payload = serde_json::json!({});
         let result = parse_event("UnknownEvent", &payload);
         assert!(result.is_err());
+    }
+
+    // ── P1-D: stale ADR filtering tests ─────────────────────────────────────
+
+    use crate::models::{ADR, Trap};
+
+    /// Helper: extract the "results" array from tool_runtime_query_memory output.
+    fn extract_results(resp: &serde_json::Value) -> Vec<serde_json::Value> {
+        let text = resp["content"][0]["text"].as_str().unwrap_or("[]");
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+        parsed["results"].as_array().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_query_memory_filters_stale_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::new(dir.path().to_path_buf());
+        let server = McpServer::new(Arc::new(sm));
+
+        // Inject a superseded ADR that would match "auth" and an unrelated active ADR.
+        {
+            let mut decisions = server.state_manager.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "auth module".into(),
+                status: "superseded".into(),
+                context: "legacy".into(),
+                decision: "old".into(),
+                tags: vec!["security".into()],
+            });
+            decisions.push(ADR {
+                id: "ADR-002".into(),
+                title: "database migration".into(),
+                status: "active".into(),
+                context: "sql".into(),
+                decision: "use postgres".into(),
+                tags: vec!["db".into()],
+            });
+        }
+
+        let args = serde_json::json!({"query_intent": "auth"});
+        let resp = server.tool_runtime_query_memory(args).await.unwrap();
+        let results = extract_results(&resp);
+
+        assert_eq!(results.len(), 0, "superseded ADR should be filtered by default");
+    }
+
+    #[tokio::test]
+    async fn test_query_memory_include_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::new(dir.path().to_path_buf());
+        let server = McpServer::new(Arc::new(sm));
+
+        {
+            let mut decisions = server.state_manager.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "auth module".into(),
+                status: "active".into(),
+                context: "legacy".into(),
+                decision: "old".into(),
+                tags: vec!["security".into()],
+            });
+            decisions.push(ADR {
+                id: "ADR-002".into(),
+                title: "auth module".into(),
+                status: "superseded".into(),
+                context: "legacy".into(),
+                decision: "old".into(),
+                tags: vec!["security".into()],
+            });
+        }
+
+        let args = serde_json::json!({"query_intent": "auth", "include_stale": true});
+        let resp = server.tool_runtime_query_memory(args).await.unwrap();
+        let results = extract_results(&resp);
+
+        assert_eq!(results.len(), 2, "both ADRs should be returned");
+        assert_eq!(results[0]["id"], "ADR-001", "active ADR should rank higher");
+        assert_eq!(results[1]["id"], "ADR-002", "stale ADR should be penalized");
+    }
+
+    #[tokio::test]
+    async fn test_query_memory_traps_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::new(dir.path().to_path_buf());
+        let server = McpServer::new(Arc::new(sm));
+
+        {
+            let mut decisions = server.state_manager.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "auth module".into(),
+                status: "superseded".into(),
+                context: "legacy".into(),
+                decision: "old".into(),
+                tags: vec!["security".into()],
+            });
+        }
+        {
+            let mut traps = server.state_manager.traps.write().await;
+            traps.push(Trap {
+                error_signature: "auth failure".into(),
+                context: "legacy".into(),
+                solution: "retry".into(),
+            });
+        }
+
+        let args = serde_json::json!({"query_intent": "auth"});
+        let resp = server.tool_runtime_query_memory(args).await.unwrap();
+        let results = extract_results(&resp);
+
+        assert_eq!(results.len(), 1, "only trap should be returned");
+        assert_eq!(results[0]["type"], "Trap", "traps must not be affected by ADR stale filter");
     }
 }
