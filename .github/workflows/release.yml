@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform_key: win32-x64
+            archive_ext: .zip
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform_key: darwin-arm64
+            archive_ext: .tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            platform_key: darwin-x64
+            archive_ext: .tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform_key: linux-x64
+            archive_ext: .tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform_key: linux-arm64
+            archive_ext: .tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archiveName = "memguard-mcp-${{ matrix.platform_key }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/memguard-mcp.exe" -Destination .
+          Compress-Archive -Path "memguard-mcp.exe" -DestinationPath $archiveName
+          Remove-Item "memguard-mcp.exe"
+          echo "ARCHIVE=$archiveName" >> $env:GITHUB_ENV
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          archiveName="memguard-mcp-${{ matrix.platform_key }}.tar.gz"
+          tar czf "$archiveName" -C "target/${{ matrix.target }}/release" memguard-mcp
+          echo "ARCHIVE=$archiveName" >> "$GITHUB_ENV"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm
+        run: cd npm && npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

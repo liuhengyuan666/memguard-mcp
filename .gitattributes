@@ -1,0 +1,15 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Shell scripts must use LF (breaks on WSL/Git Bash if CRLF)
+*.sh text eol=lf
+
+# PowerShell scripts use CRLF
+*.ps1 text eol=crlf
+
+# Rust source
+*.rs text diff=rust
+
+# YAML (GitHub Actions)
+*.yml text
+*.yaml text
