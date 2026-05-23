@@ -1,0 +1,128 @@
+# MemGuard MCP — High-Performance Agent Memory Runtime
+
+[![npm](https://img.shields.io/npm/v/@henry_lhy/memguard-mcp?color=orange)](https://www.npmjs.com/package/@henry_lhy/memguard-mcp)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-black.svg?logo=rust)](https://www.rust-lang.org/)
+
+> **The Muscle for MemGuard v3.**
+> A Git-Native, thread-safe Model Context Protocol (MCP) server written in Rust.
+
+`MemGuard MCP` is the capability engine behind the MemGuard v3 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees.
+
+⚠️ **Crucial Requirement:** This is the execution runtime. To govern *when* and *how* the agent calls these tools, you **must** install the companion behavioral contract: [memguard Core Specification](https://github.com/liuhengyuan666/memguard).
+
+---
+
+## 🚀 Core Capabilities
+
+- **Thread-Safe Concurrency (`RwLock`)**: Prevents data race conditions or state file corruption when multi-agent swarms or parallel reasoning paths access the project simultaneously.
+- **500ms Write Debouncing**: Groups aggressive, high-frequency agent thought logs into atomic file writes, mitigating disk I/O chokepoints.
+- **Parse Guard Protection**: Detects old-format `memory/*.md` files and prevents empty-state overwrites during flush cycles, preserving legacy content until the user explicitly migrates.
+
+---
+
+## 📦 Installation & Setup
+
+### From npm (Recommended)
+
+```bash
+npm install -g @henry_lhy/memguard-mcp
+```
+
+### Build From Source
+
+Ensure you have Rust and Cargo installed:
+
+```bash
+git clone https://github.com/liuhengyuan666/memguard-mcp.git
+cd memguard-mcp
+cargo build --release
+```
+
+The optimized binary will be at `target/release/memguard-mcp` (Linux/macOS) or `target/release/memguard-mcp.exe` (Windows).
+
+---
+
+## 🔌 Protocol Tool Specifications
+
+Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 3 atomic capabilities to your LLM/Agent environment:
+
+| Tool | Function | Key Parameters |
+|---|---|---|
+| `runtime_bootstrap` | Reads `memory/*.md`, rebuilds cache, returns compressed runtime summary | `project_root` (optional) |
+| `runtime_commit_event` | Unified state change entrypoint: TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged | `event_type` + `payload` |
+| `runtime_query_memory` | Keyword search over decisions and traps | `query_intent` (required), `limit` (optional, default 3) |
+
+> Agent **should not** call these tools directly — the Skill layer (SKILL.md) tells the Agent *when* to invoke them. See the companion [memguard Skill](https://github.com/liuhengyuan666/memguard) for the SOP.
+
+---
+
+## ⚙️ Mounting into MCP Hosts
+
+### OpenCode Configuration (`opencode.json`)
+
+```json
+{
+  "mcp": {
+    "memguard": {
+      "type": "local",
+      "command": ["npx", "-y", "@henry_lhy/memguard-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### Claude Desktop Configuration
+
+```json
+{
+  "mcpServers": {
+    "memguard": {
+      "command": "npx",
+      "args": ["-y", "@henry_lhy/memguard-mcp"]
+    }
+  }
+}
+```
+
+---
+
+## 📐 Memory Layout
+
+```text
+[Project Root]
+├── memory/                  # Source of Truth (Human Readable, Git Committed)
+│   ├── context.md           # Active phase, goals, current tasks, and constraints
+│   ├── decisions.md         # Architecture Decision Records (ADR, Append-Only)
+│   └── traps.md             # Error signatures, context, and solutions
+│
+└── .memguard/               # Runtime Cache (Machine Readable, add to .gitignore)
+    ├── runtime_state.json   # Serialized state graph for concurrent validation
+    └── search_index.json    # Lightweight keyword index for instant retrieval
+```
+
+---
+
+## 📐 Internal State Flow
+
+```text
+  [Agent Input] ──► [SOP Verification] ──► [MCP Tool Call]
+                                                 │
+                                                 ▼
+  [Git MD Docs] ◄── [500ms Debounce] ◄── [Rust RwLock Engine] ──► [.memguard/ Cache]
+```
+
+---
+
+## 📚 Architecture Reference
+
+- [architecture.md](architecture.md) — Full architecture design document
+- [blueprint.md](blueprint.md) — Original design blueprint
+- [MCP Development & Debugging Whitepaper](MCP（Model%20Context%20Protocol）开发与调试白皮书.md)
+
+---
+
+## ⚖️ License
+
+Licensed under the MIT License. Brand identity and commercial distribution controls apply — see the [memguard specification](https://github.com/liuhengyuan666/memguard) for full terms.
