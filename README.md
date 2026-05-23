@@ -17,7 +17,7 @@ MemGuard MCP 是 memguard v3 双层架构的**能力层**——一个 Git-native
 ### 从 npm（推荐）
 
 ```bash
-npm install -g @liuhengyuan/memguard-mcp
+npm install -g @henry_lhy/memguard-mcp
 ```
 
 ### 从源码编译
@@ -39,7 +39,7 @@ cargo build --release
   "mcp": {
     "memguard": {
       "type": "local",
-      "command": ["npx", "-y", "@liuhengyuan/memguard-mcp"],
+      "command": ["npx", "-y", "@henry_lhy/memguard-mcp"],
       "enabled": true
     }
   }
