@@ -1,9 +1,9 @@
 {
   "name": "@henry_lhy/memguard-mcp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Git-native MCP memory server for AI agents — structured project memory with ADR-based decision anchoring, trap tracking, and Explore↔Execution workflows",
   "bin": {
-    "memguard-mcp": "./cli.js"
+    "memguard-mcp": "cli.js"
   },
   "scripts": {
     "postinstall": "node install.js"
