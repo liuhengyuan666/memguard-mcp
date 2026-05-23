@@ -47,6 +47,28 @@ if ($Install) {
 
     Write-Host "To use MemGuard MCP Server with OpenCode, add this to your opencode.json:" -ForegroundColor White
     Write-Host ""
+    Write-Host "  Option A — Global install (RECOMMENDED): no args, auto-detects project via CWD" -ForegroundColor Cyan
+    Write-Host "  {" -ForegroundColor Gray
+    Write-Host '    "mcpServers": {' -ForegroundColor Gray
+    Write-Host '      "memguard": {' -ForegroundColor Gray
+    Write-Host "        \"command\": `"$binaryPath`"," -ForegroundColor Gray
+    Write-Host "        \"type\": \"local\"," -ForegroundColor Gray
+    Write-Host "        \"enabled\": true" -ForegroundColor Gray
+    Write-Host "      }" -ForegroundColor Gray
+    Write-Host "    }" -ForegroundColor Gray
+    Write-Host "  }" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option B — Environment variable (explicit project override):" -ForegroundColor Cyan
+    Write-Host "  {" -ForegroundColor Gray
+    Write-Host '    "mcpServers": {' -ForegroundColor Gray
+    Write-Host '      "memguard": {' -ForegroundColor Gray
+    Write-Host "        \"command\": `"$binaryPath`"," -ForegroundColor Gray
+    Write-Host "        \"env\": { \"MEMGUARD_PROJECT_ROOT\": `"$targetDir`" }" -ForegroundColor Gray
+    Write-Host "      }" -ForegroundColor Gray
+    Write-Host "    }" -ForegroundColor Gray
+    Write-Host "  }" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option C — CLI argument (legacy single-project deploy; DEPRECATED for global installs):" -ForegroundColor Yellow
     Write-Host "  {" -ForegroundColor Gray
     Write-Host '    "mcpServers": {' -ForegroundColor Gray
     Write-Host '      "memguard": {' -ForegroundColor Gray
@@ -58,14 +80,28 @@ if ($Install) {
 } else {
     Write-Host "To configure OpenCode, add to opencode.json:" -ForegroundColor White
     Write-Host ""
-    Write-Host "  {"
+    Write-Host "  Option A — Global install (RECOMMENDED):"
     Write-Host '    "mcpServers": {'
     Write-Host '      "memguard": {'
-    Write-Host "        \"command\": `"$binaryPath`","
+    Write-Host "        \"command\": \"<path-to-memguard-mcp.exe>\""
+    Write-Host "      }"
+    Write-Host "    }"
+    Write-Host ""
+    Write-Host "  Option B — Environment variable (explicit override):"
+    Write-Host '    "mcpServers": {'
+    Write-Host '      "memguard": {'
+    Write-Host "        \"command\": \"<path-to-memguard-mcp.exe>\","
+    Write-Host "        \"env\": { \"MEMGUARD_PROJECT_ROOT\": \"<your-project-root>\" }"
+    Write-Host "      }"
+    Write-Host "    }"
+    Write-Host ""
+    Write-Host "  Option C — CLI argument (legacy single-project deploy):"
+    Write-Host '    "mcpServers": {'
+    Write-Host '      "memguard": {'
+    Write-Host "        \"command\": \"<path-to-memguard-mcp.exe>\","
     Write-Host "        \"args\": [\"<your-project-root>\"]"
     Write-Host "      }"
     Write-Host "    }"
-    Write-Host "  }"
 }
 
 Write-Host ""
