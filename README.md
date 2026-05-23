@@ -1,40 +1,67 @@
-# MemGuard MCP — Git-Native Memory Runtime
+# MemGuard MCP — High-Performance Agent Memory Runtime
 
-> **Version**: 0.1.0 (core) / 3.0.0 (spec)  
-> **Runtime**: Rust MCP Server · RwLock thread-safe · Source-of-Truth in Markdown  
-> **Companion**: [memguard Skill](https://github.com/liuhengyuan666/memguard) — Agent SOP (行为契约)
+[![npm](https://img.shields.io/npm/v/@henry_lhy/memguard-mcp?color=orange)](https://www.npmjs.com/package/@henry_lhy/memguard-mcp)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-black.svg?logo=rust)](https://www.rust-lang.org/)
+
+> **The Muscle for MemGuard v3.**
+> A Git-Native, thread-safe Model Context Protocol (MCP) server written in Rust.
+
+`MemGuard MCP` is the capability engine behind the MemGuard v3 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees.
+
+⚠️ **Crucial Requirement:** This is the execution runtime. To govern *when* and *how* the agent calls these tools, you **must** install the companion behavioral contract: [memguard Core Specification](https://github.com/liuhengyuan666/memguard).
 
 ---
 
-MemGuard MCP 是 memguard v3 双层架构的**能力层**——一个 Git-native 的 Rust MCP Server，提供 3 个原子工具供 AI Agent 调用。
+## 🚀 Core Capabilities
 
-> **⚠️ 重要**：本仓库只包含 MCP 运行时。Agent 行为契约（何时调用工具、遵循什么规则）在 [memguard 仓](https://github.com/liuhengyuan666/memguard) 的 `SKILL.md` 中。**两者必须同时安装才能正常工作。**
+- **Thread-Safe Concurrency (`RwLock`)**: Prevents data race conditions or state file corruption when multi-agent swarms or parallel reasoning paths access the project simultaneously.
+- **500ms Write Debouncing**: Groups aggressive, high-frequency agent thought logs into atomic file writes, mitigating disk I/O chokepoints.
+- **Parse Guard Protection**: Detects old-format `memory/*.md` files and prevents empty-state overwrites during flush cycles, preserving legacy content until the user explicitly migrates.
 
 ---
 
-## 安装
+## 📦 Installation & Setup
 
-### 从 npm（推荐）
+### From npm (Recommended)
 
 ```bash
 npm install -g @henry_lhy/memguard-mcp
 ```
 
-### 从源码编译
+### Build From Source
+
+Ensure you have Rust and Cargo installed:
 
 ```bash
+git clone https://github.com/liuhengyuan666/memguard-mcp.git
+cd memguard-mcp
 cargo build --release
-# 二进制位于 target/release/memguard-mcp.exe (Windows)
-# 或 target/release/memguard-mcp (macOS/Linux)
 ```
+
+The optimized binary will be at `target/release/memguard-mcp` (Linux/macOS) or `target/release/memguard-mcp.exe` (Windows).
 
 ---
 
-## 配置
+## 🔌 Protocol Tool Specifications
 
-在你的项目 `opencode.json` 中注册 MCP server：
+Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 3 atomic capabilities to your LLM/Agent environment:
 
-```jsonc
+| Tool | Function | Key Parameters |
+|---|---|---|
+| `runtime_bootstrap` | Reads `memory/*.md`, rebuilds cache, returns compressed runtime summary | `project_root` (optional) |
+| `runtime_commit_event` | Unified state change entrypoint: TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged | `event_type` + `payload` |
+| `runtime_query_memory` | Keyword search over decisions and traps | `query_intent` (required), `limit` (optional, default 3) |
+
+> Agent **should not** call these tools directly — the Skill layer (SKILL.md) tells the Agent *when* to invoke them. See the companion [memguard Skill](https://github.com/liuhengyuan666/memguard) for the SOP.
+
+---
+
+## ⚙️ Mounting into MCP Hosts
+
+### OpenCode Configuration (`opencode.json`)
+
+```json
 {
   "mcp": {
     "memguard": {
@@ -46,57 +73,56 @@ cargo build --release
 }
 ```
 
-然后安装配套 Skill（**必须**）：
+### Claude Desktop Configuration
 
-```bash
-mkdir -p .opencode/skills/memguard
-curl -o .opencode/skills/memguard/SKILL.md \
-  https://raw.githubusercontent.com/liuhengyuan666/memguard/main/memguard/SKILL.md
+```json
+{
+  "mcpServers": {
+    "memguard": {
+      "command": "npx",
+      "args": ["-y", "@henry_lhy/memguard-mcp"]
+    }
+  }
+}
 ```
-
-完整安装指南见 [memguard README](https://github.com/liuhengyuan666/memguard#readme)。
 
 ---
 
-## MCP 工具
+## 📐 Memory Layout
 
-| 工具 | 功能 | 关键参数 |
-|------|------|----------|
-| `runtime_bootstrap` | 读取 memory/*.md，重建缓存，返回运行时摘要 | `project_root` (可选) |
-| `runtime_commit_event` | 统一状态变更：TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged | `event_type` + `payload` |
-| `runtime_query_memory` | 关键词搜索 ADR 和 Traps | `query_intent` (必填) |
-
-> Agent **不应该**直接调用这些工具——应该由 Skill（SKILL.md）告诉 Agent **何时**调用。详见配套 Skill 的 SOP。
-
----
-
-## Memory 目录
-
-```
-[项目根]/
-├── memory/                  # Source of Truth（人类可读，随 Git 提交）
-│   ├── context.md           # 当前阶段、活跃任务、约束
-│   ├── decisions.md         # ADR 格式架构决策
-│   └── traps.md             # 踩坑记录
+```text
+[Project Root]
+├── memory/                  # Source of Truth (Human Readable, Git Committed)
+│   ├── context.md           # Active phase, goals, current tasks, and constraints
+│   ├── decisions.md         # Architecture Decision Records (ADR, Append-Only)
+│   └── traps.md             # Error signatures, context, and solutions
 │
-└── .memguard/               # Runtime Cache（机器可读，应 .gitignore）
-    ├── runtime_state.json   # 状态快照
-    └── search_index.json    # 关键词索引
+└── .memguard/               # Runtime Cache (Machine Readable, add to .gitignore)
+    ├── runtime_state.json   # Serialized state graph for concurrent validation
+    └── search_index.json    # Lightweight keyword index for instant retrieval
 ```
 
 ---
 
-## 架构参考
+## 📐 Internal State Flow
 
-- [architecture.md](architecture.md) — 完整架构设计文档
-- [blueprint.md](blueprint.md) — 原始设计蓝图
-- [MCP 开发与调试白皮书](MCP（Model%20Context%20Protocol）开发与调试白皮书.md)
+```text
+  [Agent Input] ──► [SOP Verification] ──► [MCP Tool Call]
+                                                 │
+                                                 ▼
+  [Git MD Docs] ◄── [500ms Debounce] ◄── [Rust RwLock Engine] ──► [.memguard/ Cache]
+```
 
 ---
 
-## 许可
+## 📚 Architecture Reference
 
-The source code is licensed under MIT.
+- [architecture.md](architecture.md) — Full architecture design document
+- [blueprint.md](blueprint.md) — Original design blueprint
+- [MCP Development & Debugging Whitepaper](MCP（Model%20Context%20Protocol）开发与调试白皮书.md)
 
-However, the project name, logo, and branding are not permitted
-to be used for commercial distribution without explicit permission.
+---
+
+## ⚖️ License
+
+Licensed under the MIT License. Brand identity and commercial distribution controls apply — see the [memguard specification](https://github.com/liuhengyuan666/memguard) for full terms.
