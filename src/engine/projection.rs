@@ -6,7 +6,10 @@ use regex::Regex;
 
 /// Parse context.md content into RuntimeState.
 ///
-/// Expected format:
+/// Supports both new format (English H1) and legacy format (Chinese H2
+/// under an outer H1).  Render always outputs the new format.
+///
+/// New format:
 /// ```markdown
 /// # Current Phase
 /// {phase}
@@ -18,12 +21,37 @@ use regex::Regex;
 /// # Constraints
 /// - {constraint}
 /// ```
+///
+/// Legacy format (v2 skill):
+/// ```markdown
+/// # Current Context
+///
+/// ## 当前阶段
+/// ...
+///
+/// ## 关键任务
+/// ...
+///
+/// ## 当前约束
+/// ...
+/// ```
 pub fn parse_context(md: &str) -> Result<RuntimeState> {
-    let sections = md.split("\n# ");
-
     let mut current_phase: Option<String> = None;
     let mut tasks: Vec<Task> = Vec::new();
     let mut constraints: Vec<String> = Vec::new();
+
+    // Try H1 sections first (new format).  If no H1 sections are found,
+    // fall back to H2 sections (legacy format with outer H1 wrapper).
+    let h1_sections: Vec<_> = md.split("\n# ").collect();
+    let h2_sections: Vec<_> = md.split("\n## ").collect();
+
+    let sections: Vec<_> = if h1_sections.len() > 1 {
+        h1_sections.into_iter().collect()
+    } else if h2_sections.len() > 1 {
+        h2_sections.into_iter().collect()
+    } else {
+        vec![md]
+    };
 
     for section in sections {
         let section = section.trim();
@@ -31,34 +59,47 @@ pub fn parse_context(md: &str) -> Result<RuntimeState> {
             continue;
         }
 
-        // The first section keeps the "# " prefix from the split boundary.
-        // Subsequent sections have it stripped.  Handle both cases.
-        if let Some(rest) = section
-            .strip_prefix("Current Phase")
-            .or_else(|| section.strip_prefix("# Current Phase"))
-        {
+        // Match section name against English and Chinese aliases.
+        // `match_section_title` strips the title and returns the body text.
+        if let Some(rest) = match_section_title(section, &["Current Phase", "当前阶段", "阶段"]) {
             current_phase = Some(extract_section_body(rest));
-        } else if let Some(rest) = section
-            .strip_prefix("Active Tasks")
-            .or_else(|| section.strip_prefix("# Active Tasks"))
-        {
+        } else if let Some(rest) = match_section_title(section, &[
+            "Active Tasks", "关键任务", "当前任务", "任务",
+        ]) {
             tasks = parse_task_lines(rest);
-        } else if let Some(rest) = section
-            .strip_prefix("Constraints")
-            .or_else(|| section.strip_prefix("# Constraints"))
-        {
+        } else if let Some(rest) = match_section_title(section, &[
+            "Constraints", "当前约束", "约束条件", "约束",
+        ]) {
             constraints = parse_bullet_list(rest);
         }
     }
 
-    let current_phase =
-        current_phase.ok_or_else(|| anyhow!("Missing '# Current Phase' section in context.md"))?;
+    let current_phase = current_phase.ok_or_else(|| {
+        anyhow!(
+            "Missing 'Current Phase' / '当前阶段' section in context.md"
+        )
+    })?;
 
     Ok(RuntimeState {
         current_phase,
         active_tasks: tasks,
         constraints,
     })
+}
+
+/// Try to strip a section title (with optional leading "# " or "## ") from the
+/// beginning of `section`.  Returns the remaining text after the title.
+fn match_section_title<'a>(section: &'a str, titles: &[&str]) -> Option<&'a str> {
+    let after_header = section
+        .strip_prefix("## ")
+        .or_else(|| section.strip_prefix("# "))
+        .unwrap_or(section);
+    for t in titles {
+        if let Some(rest) = after_header.strip_prefix(t) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 /// Render RuntimeState back to context.md Markdown.
@@ -379,11 +420,26 @@ fn extract_section_body(rest: &str) -> String {
         .join(" ")
 }
 
-/// Parse lines like `- [Todo] [TASK-XXX] description` or `- [Todo] description` into a Vec<Task>.
-/// Task IDs are extracted from the markdown if present, otherwise generated sequentially.
+/// Parse task lines into a Vec<Task>.
+///
+/// Supports three formats:
+/// - New:   `- [Todo] [TASK-XXX] description`
+/// - Legacy checkbox: `- [ ] description`
+/// - Legacy plain:    `- description`
+///
+/// Task IDs are extracted from the markdown if present, otherwise generated
+/// sequentially.  Legacy formats without explicit status default to `Todo`.
 fn parse_task_lines(rest: &str) -> Vec<Task> {
     static TASK_LINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^-\s*\[(Todo|InProgress|Done)\]\s*(?:\[(TASK-\d{3})\]\s*)?(.*)").unwrap()
+    });
+
+    static LEGACY_CB_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^-\s*\[\s*\]\s*(.*)").unwrap()
+    });
+
+    static LEGACY_PLAIN_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^-\s+(.*)").unwrap()
     });
 
     let mut tasks = Vec::new();
@@ -393,6 +449,8 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
         if line.is_empty() {
             continue;
         }
+
+        // Try new format first.
         if let Some(caps) = TASK_LINE_RE.captures(line) {
             let status_str = &caps[1];
             let id = caps
@@ -412,6 +470,33 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                 description: desc,
                 status,
             });
+            continue;
+        }
+
+        // Legacy checkbox: `- [ ] description`
+        if let Some(caps) = LEGACY_CB_RE.captures(line) {
+            let desc = caps[1].trim().to_string();
+            if !desc.is_empty() {
+                tasks.push(Task {
+                    id: format!("TASK-{:03}", tasks.len()),
+                    description: desc,
+                    status: TaskStatus::Todo,
+                });
+            }
+            continue;
+        }
+
+        // Legacy plain bullet: `- description`
+        // Guard against double-matching new format (already tried above).
+        if let Some(caps) = LEGACY_PLAIN_RE.captures(line) {
+            let desc = caps[1].trim().to_string();
+            if !desc.is_empty() {
+                tasks.push(Task {
+                    id: format!("TASK-{:03}", tasks.len()),
+                    description: desc,
+                    status: TaskStatus::Todo,
+                });
+            }
         }
     }
 
@@ -476,6 +561,53 @@ mod tests {
         let state2 = parse_context(&rendered).unwrap();
         assert_eq!(state.current_phase, state2.current_phase);
         assert_eq!(state.active_tasks.len(), state2.active_tasks.len());
+    }
+
+    // ── Legacy Chinese H2 format (v2 skill) ────────────────────────────
+
+    #[test]
+    fn test_parse_context_legacy_chinese_h2() {
+        let md = concat!(
+            "# Current Context\n\n",
+            "## 当前阶段\n",
+            "执行模式\n\n",
+            "## 关键任务\n",
+            "- [ ] 任务一\n",
+            "- 任务二\n\n",
+            "## 当前约束\n",
+            "- 必须使用 PostgreSQL\n",
+            "- 不允许使用 ORM\n"
+        );
+        let state = parse_context(md).unwrap();
+        assert_eq!(state.current_phase, "执行模式");
+        assert_eq!(state.active_tasks.len(), 2);
+        assert_eq!(state.active_tasks[0].description, "任务一");
+        assert!(matches!(state.active_tasks[0].status, TaskStatus::Todo));
+        assert_eq!(state.active_tasks[1].description, "任务二");
+        assert!(matches!(state.active_tasks[1].status, TaskStatus::Todo));
+        assert_eq!(state.constraints.len(), 2);
+        assert_eq!(state.constraints[0], "必须使用 PostgreSQL");
+    }
+
+    #[test]
+    fn test_parse_context_legacy_mixed() {
+        // A file that has both H1 and H2 — the parser should pick the
+        // dominant level and still produce correct results.
+        let md = concat!(
+            "# Current Context\n\n",
+            "## 当前阶段\n",
+            "planning\n\n",
+            "## 关键任务\n",
+            "- [Todo] [TASK-000] Modern task\n",
+            "- [ ] Legacy task\n\n",
+            "## 当前约束\n",
+            "- Limit memory\n"
+        );
+        let state = parse_context(md).unwrap();
+        assert_eq!(state.current_phase, "planning");
+        assert_eq!(state.active_tasks.len(), 2);
+        assert_eq!(state.active_tasks[0].description, "Modern task");
+        assert_eq!(state.active_tasks[1].description, "Legacy task");
     }
 
     // ── decisions.md ───────────────────────────────────────────────────
@@ -558,4 +690,5 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].error_signature, "Timeout");
     }
+
 }

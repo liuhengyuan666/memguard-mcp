@@ -3,6 +3,7 @@ use crate::models::{RuntimeEvent, TaskStatus};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -64,12 +65,11 @@ impl McpServer {
             project_root
         );
 
-        // Bootstrap state from disk before accepting requests.
-        self.state_manager
-            .bootstrap()
-            .await
-            .context("Bootstrap failed")?;
-        eprintln!("[memguard] Runtime state bootstrapped.");
+        // Bootstrap is deferred to `handle_initialize()` — the MCP client
+        // sends its workspace root in the initialize request, which is the
+        // authoritative project path.  Starting with CWD avoids heuristic
+        // guesswork that could find the wrong project.
+        eprintln!("[memguard] Waiting for MCP initialize handshake...");
 
         // TODO(Robustness): Current stdio transport assumes strict JSON-Lines (newline delimited).
         // If the MCP client sends LSP-style headers (e.g., Content-Length: \r\n\r\n),
@@ -166,7 +166,11 @@ impl McpServer {
             stdout.flush().await?;
         }
 
-        eprintln!("[memguard] stdin closed, shutting down.");
+        eprintln!("[memguard] stdin closed, flushing state before shutdown...");
+        if let Err(e) = self.state_manager.flush_now().await {
+            eprintln!("[memguard] ERROR during shutdown flush: {}", e);
+        }
+        eprintln!("[memguard] shutting down.");
         Ok(())
     }
 
@@ -190,10 +194,90 @@ impl McpServer {
     // ── MCP Protocol Handlers ─────────────────────────────────────────
 
     /// MCP initialize handshake.
+    ///
+    /// Uses `workspaceFolders` or `rootUri` from the client to determine
+    /// the authoritative project root.  Bootstraps runtime state from that
+    /// directory's `memory/*.md` files.  This is the SINGLE bootstrap point —
+    /// `server.run()` does NOT bootstrap, so the server always starts from
+    /// the correct workspace.
     async fn handle_initialize(
         &self,
-        _params: Option<Value>,
+        params: Option<Value>,
     ) -> Result<Value, McpError> {
+        let mut workspace_root: Option<PathBuf> = None;
+
+        if let Some(p) = params {
+            let maybe_uri = p
+                .get("workspaceFolders")
+                .and_then(|wf| wf.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|folder| folder.get("uri"))
+                .and_then(|uri| uri.as_str())
+                .or_else(|| p.get("rootUri").and_then(|uri| uri.as_str()));
+
+            if let Some(uri) = maybe_uri {
+                let inferred = uri
+                    .strip_prefix("file:///")
+                    .or_else(|| uri.strip_prefix("file://"))
+                    .unwrap_or(uri);
+                let inferred_path = PathBuf::from(inferred);
+                let inferred_path = inferred_path.canonicalize().unwrap_or_else(|e| {
+                    eprintln!(
+                        "[memguard] WARNING: cannot canonicalize workspace path '{}': {} — using raw path",
+                        inferred, e
+                    );
+                    PathBuf::from(inferred)
+                });
+                workspace_root = Some(inferred_path);
+            }
+        }
+
+        // Bootstrap from the authoritative workspace root.
+        if let Some(root) = workspace_root {
+            let current = self.state_manager.project_root.read().await.clone();
+            if root != current {
+                eprintln!(
+                    "[memguard] MCP workspace differs from startup root. \
+                     Switching: {} -> {}",
+                    current.display(),
+                    root.display()
+                );
+                if let Err(e) = self.state_manager.switch_project(root).await {
+                    eprintln!(
+                        "[memguard] ERROR bootstrapping from workspace: {}",
+                        e
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[memguard] MCP workspace aligns with startup root: {}",
+                    root.display()
+                );
+                if let Err(e) = self.state_manager.bootstrap().await {
+                    eprintln!(
+                        "[memguard] ERROR bootstrapping from aligned root: {}",
+                        e
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[memguard] WARNING: MCP client did not provide workspaceFolders or rootUri."
+            );
+            eprintln!(
+                "[memguard] Bootstrapping from startup project root (CWD): \
+                 ensure OpenCode spawns this server with the project directory as CWD."
+            );
+            if let Err(e) = self.state_manager.bootstrap().await {
+                eprintln!(
+                    "[memguard] ERROR bootstrapping from startup root: {}",
+                    e
+                );
+            }
+        }
+
+        eprintln!("[memguard] Runtime state bootstrapped.");
+
         Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -212,11 +296,15 @@ impl McpServer {
             "tools": [
                 {
                     "name": "runtime_bootstrap",
-                    "description": "Start session or recover from context loss. Reads memory/*.md, rebuilds cache, returns compressed runtime summary.",
+                    "description": "Start session or recover from context loss. Reads memory/*.md, rebuilds cache, returns compressed runtime summary. Optionally accepts project_root to switch to a different project directory.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
-                        "required": []
+                        "properties": {
+                            "project_root": {
+                                "type": "string",
+                                "description": "Optional absolute path to the project root directory. If provided, memguard will switch to this project's memory context."
+                            }
+                        }
                     }
                 },
                 {
@@ -276,7 +364,7 @@ impl McpServer {
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
         match tool_name {
-            "runtime_bootstrap" => self.tool_runtime_bootstrap().await,
+            "runtime_bootstrap" => self.tool_runtime_bootstrap(arguments).await,
             "runtime_commit_event" => {
                 self.tool_runtime_commit_event(arguments).await
             }
@@ -293,7 +381,39 @@ impl McpServer {
     // ── Tool Implementations ──────────────────────────────────────────
 
     /// runtime_bootstrap: return compressed runtime summary.
-    async fn tool_runtime_bootstrap(&self) -> Result<Value, McpError> {
+    ///
+    /// If `project_root` is provided in `args`, switches the active project
+    /// context before returning the summary.  This allows a single memguard
+    /// process to serve multiple projects.
+    async fn tool_runtime_bootstrap(
+        &self,
+        args: Value,
+    ) -> Result<Value, McpError> {
+        // Optional project switch.
+        if let Some(root_str) = args.get("project_root").and_then(|v| v.as_str()) {
+            let new_root = PathBuf::from(root_str)
+                .canonicalize()
+                .map_err(|e| {
+                    McpError::InvalidParams(format!(
+                        "Invalid project_root path '{}': {}",
+                        root_str, e
+                    ))
+                })?;
+            eprintln!(
+                "[memguard] runtime_bootstrap switching to project: {}",
+                new_root.display()
+            );
+            self.state_manager
+                .switch_project(new_root)
+                .await
+                .map_err(|e| {
+                    McpError::Internal(format!(
+                        "Project switch failed: {}",
+                        e
+                    ))
+                })?;
+        }
+
         let state = self.state_manager.state.read().await;
         let decisions = self.state_manager.decisions.read().await;
 

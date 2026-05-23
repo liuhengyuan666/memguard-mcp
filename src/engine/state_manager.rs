@@ -2,6 +2,7 @@ use crate::engine::projection;
 use crate::models::*;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
@@ -17,8 +18,15 @@ pub struct StateManager {
     pub state: Arc<RwLock<RuntimeState>>,
     pub decisions: Arc<RwLock<Vec<ADR>>>,
     pub traps: Arc<RwLock<Vec<Trap>>>,
-    pub project_root: PathBuf,
+    pub project_root: Arc<RwLock<PathBuf>>,
+    flush_generation: Arc<AtomicU64>,
     flush_tx: mpsc::UnboundedSender<()>,
+    /// Set to true when context.md was successfully parsed (or user committed
+    /// real data).  While false, flush_inner will NOT overwrite context.md —
+    /// protecting old-format files from being nuked by empty-state writes.
+    context_ok: Arc<AtomicBool>,
+    decisions_ok: Arc<AtomicBool>,
+    traps_ok: Arc<AtomicBool>,
 }
 
 impl StateManager {
@@ -33,11 +41,24 @@ impl StateManager {
         let traps = Arc::new(RwLock::new(Vec::new()));
         let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<()>();
 
+        // Parse-success guards: protect old-format files from being
+        // overwritten by empty-state flushes.  Set to true when parsing
+        // succeeds or when the user commits real data via events.
+        let context_ok = Arc::new(AtomicBool::new(false));
+        let decisions_ok = Arc::new(AtomicBool::new(false));
+        let traps_ok = Arc::new(AtomicBool::new(false));
+
         // Spawn the debounced flush loop.  Clones are cheap (Arc bumps).
         let s = state.clone();
         let d = decisions.clone();
         let t = traps.clone();
-        let root = project_root.clone();
+        let root = Arc::new(RwLock::new(project_root));
+        let root_for_task = root.clone();
+        let flush_generation = Arc::new(AtomicU64::new(0));
+        let flush_gen_for_task = flush_generation.clone();
+        let ctx_ok = context_ok.clone();
+        let dec_ok = decisions_ok.clone();
+        let trp_ok = traps_ok.clone();
 
         tokio::spawn(async move {
             loop {
@@ -61,7 +82,27 @@ impl StateManager {
                     }
                 }
 
-                flush_inner(&s, &d, &t, &root).await;
+                // Snapshot root and generation atomically.
+                // If generation changes before we finish, abort to avoid
+                // writing wrong-project data to the wrong directory.
+                let gen_snapshot = flush_gen_for_task.load(Ordering::Acquire);
+                let root_path = root_for_task.read().await.clone();
+
+                // Double-check generation after reading root.
+                if flush_gen_for_task.load(Ordering::Acquire) != gen_snapshot {
+                    eprintln!("[memguard] Flush aborted: project root changed mid-flush");
+                    continue;
+                }
+
+                flush_inner(&s, &d, &t, &root_path, &ctx_ok, &dec_ok, &trp_ok).await.unwrap_or_else(|e| {
+                    eprintln!("[memguard] flush error: {}", e);
+                });
+
+                // After writing, verify generation hasn't changed.
+                // If it has, the next flush cycle will correct any stale data.
+                if flush_gen_for_task.load(Ordering::Acquire) != gen_snapshot {
+                    eprintln!("[memguard] WARNING: project switched during flush; next flush will correct.");
+                }
             }
         });
 
@@ -69,9 +110,90 @@ impl StateManager {
             state,
             decisions,
             traps,
-            project_root,
+            project_root: root,
+            flush_generation,
             flush_tx,
+            context_ok,
+            decisions_ok,
+            traps_ok,
         }
+    }
+
+    /// Switch to a different project root, loading its state from disk.
+    ///
+    /// Flushes all pending writes for the current project BEFORE switching,
+    /// then bumps a generation counter to abort any in-flight flush tasks,
+    /// preventing cross-project data leaks.
+    ///
+    /// The active `project_root` is updated only AFTER the new project's
+    /// state is successfully loaded from disk — if parsing fails, the
+    /// root is left unchanged so the caller can retry or fall back safely.
+    ///
+    /// State is loaded and swapped atomically (all three RwLocks held
+    /// simultaneously) so no intermediate "empty" state is ever visible
+    /// to the debounced flush task.
+    pub async fn switch_project(&self, new_root: PathBuf) -> Result<()> {
+        // 1. Flush pending data for the current project BEFORE switching.
+        self.flush_now().await?;
+
+        // 2. Bump generation to signal in-flight flush tasks to abort.
+        self.flush_generation.fetch_add(1, Ordering::Release);
+
+        // 3. Load new project state from disk into temporary variables.
+        //    project_root is NOT updated yet — if loading fails (e.g.
+        //    parse error), the active project reference remains unchanged
+        //    and no cross-project state corruption occurs.
+        let loaded = load_state_from_disk(&new_root).await?;
+        let is_greenfield = loaded.is_greenfield;
+
+        // 4. Update the active project root (only after load succeeds).
+        *self.project_root.write().await = new_root;
+        let project_root = self.project_root.read().await.clone();
+
+        // 5. Atomic swap: acquire all three write locks in the globally
+        //    consistent order (state → decisions → traps), perform the
+        //    assignment, then drop all guards — no .await points between.
+        {
+            let mut s = self.state.write().await;
+            let mut d = self.decisions.write().await;
+            let mut t = self.traps.write().await;
+            *s = loaded.state;
+            *d = loaded.decisions;
+            *t = loaded.traps;
+        }
+
+        // Track parse success for flush guard.
+        self.context_ok.store(loaded.context_parsed, Ordering::Release);
+        self.decisions_ok.store(loaded.decisions_parsed, Ordering::Release);
+        self.traps_ok.store(loaded.traps_parsed, Ordering::Release);
+
+        // 6. If the target project has no memory/ yet, seed defaults.
+        if is_greenfield {
+            let memory_dir = project_root.join("memory");
+            tokio::fs::create_dir_all(&memory_dir)
+                .await
+                .context("Failed to create memory/ directory")?;
+
+            let default_ctx =
+                "# Current Phase\n\n# Active Tasks\n\n# Constraints\n";
+            tokio::fs::write(memory_dir.join("context.md"), default_ctx)
+                .await
+                .context("Failed to write default memory/context.md")?;
+            tokio::fs::write(memory_dir.join("decisions.md"), "")
+                .await
+                .context("Failed to write default memory/decisions.md")?;
+            tokio::fs::write(memory_dir.join("traps.md"), "")
+                .await
+                .context("Failed to write default memory/traps.md")?;
+        }
+
+        // 7. Ensure .memguard/ exists, then write cache files.
+        tokio::fs::create_dir_all(&project_root.join(".memguard"))
+            .await
+            .context("Failed to create .memguard/ directory")?;
+        self.write_cache().await?;
+
+        Ok(())
     }
 
     // ── Bootstrap ──────────────────────────────────────────────────────
@@ -81,55 +203,37 @@ impl StateManager {
     /// - If `memory/` exists: parse its Markdown files into memory.
     /// - If `memory/` does NOT exist: create it with empty defaults.
     /// - Always ensures `.memguard/` exists and writes cache files.
+    ///
+    /// Uses atomic three-lock swap so no intermediate empty state is
+    /// visible to the debounced flush task.
     pub async fn bootstrap(&self) -> Result<()> {
-        let memory_dir = self.project_root.join("memory");
-        let memguard_dir = self.project_root.join(".memguard");
+        let project_root = self.project_root.read().await.clone();
+        let memguard_dir = project_root.join(".memguard");
 
         tokio::fs::create_dir_all(&memguard_dir)
             .await
             .context("Failed to create .memguard/ directory")?;
 
-        if tokio::fs::try_exists(&memory_dir)
-            .await
-            .unwrap_or(false)
+        let loaded = load_state_from_disk(&project_root).await?;
+
+        // Atomic swap: acquire all three write locks in consistent order.
         {
-            // ── Load existing memory ────────────────────────────────
+            let mut s = self.state.write().await;
+            let mut d = self.decisions.write().await;
+            let mut t = self.traps.write().await;
+            *s = loaded.state;
+            *d = loaded.decisions;
+            *t = loaded.traps;
+        }
 
-            // context.md
-            let ctx_path = memory_dir.join("context.md");
-            if tokio::fs::try_exists(&ctx_path).await.unwrap_or(false) {
-                let content = tokio::fs::read_to_string(&ctx_path)
-                    .await
-                    .context("Failed to read memory/context.md")?;
-                let state = projection::parse_context(&content)
-                    .context("Failed to parse memory/context.md")?;
-                *self.state.write().await = state;
-            }
+        // Track parse success for flush guard.
+        self.context_ok.store(loaded.context_parsed, Ordering::Release);
+        self.decisions_ok.store(loaded.decisions_parsed, Ordering::Release);
+        self.traps_ok.store(loaded.traps_parsed, Ordering::Release);
 
-            // decisions.md
-            let dec_path = memory_dir.join("decisions.md");
-            if tokio::fs::try_exists(&dec_path).await.unwrap_or(false) {
-                let content = tokio::fs::read_to_string(&dec_path)
-                    .await
-                    .context("Failed to read memory/decisions.md")?;
-                let adrs = projection::parse_decisions(&content)
-                    .context("Failed to parse memory/decisions.md")?;
-                *self.decisions.write().await = adrs;
-            }
-
-            // traps.md
-            let trp_path = memory_dir.join("traps.md");
-            if tokio::fs::try_exists(&trp_path).await.unwrap_or(false) {
-                let content = tokio::fs::read_to_string(&trp_path)
-                    .await
-                    .context("Failed to read memory/traps.md")?;
-                let traps = projection::parse_traps(&content)
-                    .context("Failed to parse memory/traps.md")?;
-                *self.traps.write().await = traps;
-            }
-        } else {
-            // ── Greenfield: create memory/ with defaults ─────────────
-
+        // If greenfield, write default files to disk.
+        if loaded.is_greenfield {
+            let memory_dir = project_root.join("memory");
             tokio::fs::create_dir_all(&memory_dir)
                 .await
                 .context("Failed to create memory/ directory")?;
@@ -148,7 +252,6 @@ impl StateManager {
         }
 
         // ── Always write cache files ────────────────────────────────
-
         self.write_cache().await?;
 
         Ok(())
@@ -191,16 +294,21 @@ impl StateManager {
                 let mut adr = adr;
                 adr.status = "active".to_string();
                 decisions.push(adr);
+                self.decisions_ok.store(true, Ordering::Release);
             }
 
             RuntimeEvent::TrapRecorded(trap) => {
                 let mut traps = self.traps.write().await;
                 traps.push(trap);
+                self.traps_ok.store(true, Ordering::Release);
             }
 
             RuntimeEvent::PhaseChanged(new_phase) => {
                 let mut state = self.state.write().await;
                 state.current_phase = new_phase;
+                // Auto-unlock: user is actively using the new system,
+                // so overwriting old-format context.md is now safe.
+                self.context_ok.store(true, Ordering::Release);
             }
         }
 
@@ -210,17 +318,26 @@ impl StateManager {
     }
 
     /// Manually trigger an immediate flush to disk (bypasses debounce).
-    #[allow(dead_code)]
     pub async fn flush_now(&self) -> Result<()> {
-        flush_inner(&self.state, &self.decisions, &self.traps, &self.project_root).await;
-        Ok(())
+        let root = self.project_root.read().await.clone();
+        flush_inner(
+            &self.state,
+            &self.decisions,
+            &self.traps,
+            &root,
+            &self.context_ok,
+            &self.decisions_ok,
+            &self.traps_ok,
+        )
+        .await
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Write cache files (runtime_state.json, search_index.json).
     async fn write_cache(&self) -> Result<()> {
-        let memguard_dir = self.project_root.join(".memguard");
+        let project_root = self.project_root.read().await.clone();
+        let memguard_dir = project_root.join(".memguard");
 
         // runtime_state.json
         {
@@ -275,24 +392,184 @@ impl StateManager {
 
 // ── Free functions ─────────────────────────────────────────────────────────
 
+/// Loaded runtime state from disk, with per-file parse-success flags.
+struct LoadedFiles {
+    state: RuntimeState,
+    decisions: Vec<ADR>,
+    traps: Vec<Trap>,
+    is_greenfield: bool,
+    context_parsed: bool,
+    decisions_parsed: bool,
+    traps_parsed: bool,
+}
+
+/// Load runtime state from `{root}/memory/*.md` files.
+///
+/// Returns `LoadedFiles` with per-file parse-success flags.  When a file
+/// exists but can't be parsed (e.g. old-format), the parse flag is `false`
+/// and empty defaults are returned — but the on-disk file is NOT touched
+/// until the user explicitly commits new data.
+///
+/// **Error handling**: `try_exists` failures are propagated as errors
+/// rather than silently treated as "doesn't exist" — preventing transient
+/// filesystem issues from triggering the greenfield path which would
+/// overwrite existing files with empty content.
+async fn load_state_from_disk(
+    root: &PathBuf,
+) -> Result<LoadedFiles> {
+    let memory_dir = root.join("memory");
+
+    let exists = tokio::fs::try_exists(&memory_dir)
+        .await
+        .context("Failed to check memory/ existence")?;
+
+    if !exists {
+        return Ok(LoadedFiles {
+            state: RuntimeState {
+                current_phase: String::new(),
+                active_tasks: Vec::new(),
+                constraints: Vec::new(),
+            },
+            decisions: Vec::new(),
+            traps: Vec::new(),
+            is_greenfield: true,
+            context_parsed: true,   // greenfield: nothing to parse, no risk
+            decisions_parsed: true,
+            traps_parsed: true,
+        });
+    }
+
+    let mut context_parsed = false;
+    let mut decisions_parsed = false;
+    let mut traps_parsed = false;
+
+    // ── Load context.md ─────────────────────────────────────────
+    let state = {
+        let ctx_path = memory_dir.join("context.md");
+        if tokio::fs::try_exists(&ctx_path)
+            .await
+            .context("Failed to check memory/context.md existence")?
+        {
+            let content = tokio::fs::read_to_string(&ctx_path)
+                .await
+                .context("Failed to read memory/context.md")?;
+            match projection::parse_context(&content) {
+                Ok(s) => {
+                    context_parsed = true;
+                    s
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[memguard] WARNING: failed to parse memory/context.md (old format?): {}",
+                        e
+                    );
+                    eprintln!(
+                        "[memguard] The file is preserved as-is. To migrate: have the LLM read the old file,",
+                    );
+                    eprintln!(
+                        "[memguard] convert content to new format, and write it back. Then re-run bootstrap.",
+                    );
+                    RuntimeState {
+                        current_phase: String::new(),
+                        active_tasks: Vec::new(),
+                        constraints: Vec::new(),
+                    }
+                }
+            }
+        } else {
+            RuntimeState {
+                current_phase: String::new(),
+                active_tasks: Vec::new(),
+                constraints: Vec::new(),
+            }
+        }
+    };
+
+    // ── Load decisions.md ───────────────────────────────────────
+    let decisions = {
+        let dec_path = memory_dir.join("decisions.md");
+        if tokio::fs::try_exists(&dec_path)
+            .await
+            .context("Failed to check memory/decisions.md existence")?
+        {
+            let content = tokio::fs::read_to_string(&dec_path)
+                .await
+                .context("Failed to read memory/decisions.md")?;
+            projection::parse_decisions(&content)
+                .context("Failed to parse memory/decisions.md")?
+        } else {
+            Vec::new()
+        }
+    };
+    if !decisions.is_empty() {
+        decisions_parsed = true;
+    }
+
+    // ── Load traps.md ───────────────────────────────────────────
+    let traps = {
+        let trp_path = memory_dir.join("traps.md");
+        if tokio::fs::try_exists(&trp_path)
+            .await
+            .context("Failed to check memory/traps.md existence")?
+        {
+            let content = tokio::fs::read_to_string(&trp_path)
+                .await
+                .context("Failed to read memory/traps.md")?;
+            projection::parse_traps(&content)
+                .context("Failed to parse memory/traps.md")?
+        } else {
+            Vec::new()
+        }
+    };
+    if !traps.is_empty() {
+        traps_parsed = true;
+    }
+
+    Ok(LoadedFiles {
+        state,
+        decisions,
+        traps,
+        is_greenfield: false,
+        context_parsed,
+        decisions_parsed,
+        traps_parsed,
+    })
+}
+
 /// Core flush routine: read-lock state, render all three Markdown files,
 /// write to disk.  Used by both the debounced task and `flush_now()`.
 ///
-/// **Graceful degradation**: if a single file write fails, the error is
-/// logged and the remaining writes are attempted.  The `.memguard/` cache
-/// is always written last so it can serve as a recovery anchor.
+/// **Parse-guard**: if a file's parse-success flag is `false` and the
+/// rendered content is empty, the write is skipped.  This prevents
+/// old-format files from being overwritten with empty skeletons when
+/// the parser couldn't understand them.  The flag auto-clears when the
+/// user commits real data via a corresponding `runtime_commit_event`.
+///
+/// **Graceful degradation with error reporting**: directory creation
+/// failures are fatal (can't proceed without directories).  Individual
+/// file write errors are collected — all files are attempted, then a
+/// combined error is returned if any failed.
 async fn flush_inner(
     state: &Arc<RwLock<RuntimeState>>,
     decisions: &Arc<RwLock<Vec<ADR>>>,
     traps: &Arc<RwLock<Vec<Trap>>>,
     project_root: &PathBuf,
-) {
+    context_ok: &AtomicBool,
+    decisions_ok: &AtomicBool,
+    traps_ok: &AtomicBool,
+) -> Result<()> {
     let memory_dir = project_root.join("memory");
     let memguard_dir = project_root.join(".memguard");
 
-    // Ensure directories exist (best-effort).
-    let _ = tokio::fs::create_dir_all(&memory_dir).await;
-    let _ = tokio::fs::create_dir_all(&memguard_dir).await;
+    // Directory creation is mandatory — bail early on failure.
+    tokio::fs::create_dir_all(&memory_dir)
+        .await
+        .context("Failed to create memory/ directory")?;
+    tokio::fs::create_dir_all(&memguard_dir)
+        .await
+        .context("Failed to create .memguard/ directory")?;
+
+    let mut errors: Vec<String> = Vec::new();
 
     // ── Write memory/*.md files ─────────────────────────────────────
 
@@ -300,13 +577,17 @@ async fn flush_inner(
     {
         let s = state.read().await;
         let rendered = projection::render_context(&s);
-        if let Err(e) =
+        let is_empty = s.current_phase.is_empty()
+            && s.active_tasks.is_empty()
+            && s.constraints.is_empty();
+        if !context_ok.load(Ordering::Acquire) && is_empty {
+            eprintln!(
+                "[memguard] Skipping context.md flush — file was not successfully parsed and state is empty. Old content preserved."
+            );
+        } else if let Err(e) =
             tokio::fs::write(memory_dir.join("context.md"), &rendered).await
         {
-            eprintln!(
-                "[memguard] ERROR writing memory/context.md: {}",
-                e
-            );
+            errors.push(format!("memory/context.md: {}", e));
         }
     }
 
@@ -314,13 +595,14 @@ async fn flush_inner(
     {
         let d = decisions.read().await;
         let rendered = projection::render_decisions(&d);
-        if let Err(e) =
+        if !decisions_ok.load(Ordering::Acquire) && d.is_empty() {
+            eprintln!(
+                "[memguard] Skipping decisions.md flush — file was not successfully parsed and decisions are empty. Old content preserved."
+            );
+        } else if let Err(e) =
             tokio::fs::write(memory_dir.join("decisions.md"), &rendered).await
         {
-            eprintln!(
-                "[memguard] ERROR writing memory/decisions.md: {}",
-                e
-            );
+            errors.push(format!("memory/decisions.md: {}", e));
         }
     }
 
@@ -328,13 +610,14 @@ async fn flush_inner(
     {
         let t = traps.read().await;
         let rendered = projection::render_traps(&t);
-        if let Err(e) =
+        if !traps_ok.load(Ordering::Acquire) && t.is_empty() {
+            eprintln!(
+                "[memguard] Skipping traps.md flush — file was not successfully parsed and traps are empty. Old content preserved."
+            );
+        } else if let Err(e) =
             tokio::fs::write(memory_dir.join("traps.md"), &rendered).await
         {
-            eprintln!(
-                "[memguard] ERROR writing memory/traps.md: {}",
-                e
-            );
+            errors.push(format!("memory/traps.md: {}", e));
         }
     }
 
@@ -351,17 +634,11 @@ async fn flush_inner(
                 )
                 .await
                 {
-                    eprintln!(
-                        "[memguard] ERROR writing .memguard/runtime_state.json: {}",
-                        e
-                    );
+                    errors.push(format!(".memguard/runtime_state.json: {}", e));
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[memguard] ERROR serializing runtime_state: {}",
-                    e
-                );
+                errors.push(format!(".memguard/runtime_state.json serialize: {}", e));
             }
         }
     }
@@ -403,19 +680,23 @@ async fn flush_inner(
                 )
                 .await
                 {
-                    eprintln!(
-                        "[memguard] ERROR writing .memguard/search_index.json: {}",
-                        e
-                    );
+                    errors.push(format!(".memguard/search_index.json: {}", e));
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[memguard] ERROR serializing search_index: {}",
-                    e
-                );
+                errors.push(format!(".memguard/search_index.json serialize: {}", e));
             }
         }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{} flush error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
     }
 }
 
@@ -438,13 +719,14 @@ mod tests {
         mgr.bootstrap().await.expect("bootstrap should succeed");
 
         // Verify memory/ was created with default files.
-        let memory_dir = mgr.project_root.join("memory");
+        let project_root = mgr.project_root.read().await.clone();
+        let memory_dir = project_root.join("memory");
         assert!(memory_dir.join("context.md").exists());
         assert!(memory_dir.join("decisions.md").exists());
         assert!(memory_dir.join("traps.md").exists());
 
         // Verify .memguard/ cache was created.
-        let cache_dir = mgr.project_root.join(".memguard");
+        let cache_dir = project_root.join(".memguard");
         assert!(cache_dir.join("runtime_state.json").exists());
         assert!(cache_dir.join("search_index.json").exists());
 
@@ -617,8 +899,9 @@ mod tests {
         mgr.flush_now().await.expect("flush should succeed");
 
         // Read back context.md and verify.
+        let project_root = mgr.project_root.read().await.clone();
         let content =
-            tokio::fs::read_to_string(mgr.project_root.join("memory/context.md"))
+            tokio::fs::read_to_string(project_root.join("memory/context.md"))
                 .await
                 .unwrap();
         assert!(content.contains("testing"));
