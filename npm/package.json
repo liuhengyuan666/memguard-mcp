@@ -10,7 +10,8 @@
   },
   "files": [
     "index.js",
-    "install.js"
+    "install.js",
+    "LICENSE"
   ],
   "keywords": [
     "mcp",
