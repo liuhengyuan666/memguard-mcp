@@ -1,1 +1,8 @@
 /target
+
+# MemGuard runtime cache (derived from memory/*.md).memguard/
+
+# MemGuard test memory artifacts
+memory/
+
+# OpenCode internal files.omo/
