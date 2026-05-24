@@ -62,7 +62,7 @@ pub fn parse_context(md: &str) -> Result<RuntimeState> {
         // Match section name against English and Chinese aliases.
         // `match_section_title` strips the title and returns the body text.
         if let Some(rest) = match_section_title(section, &["Current Phase", "当前阶段", "阶段"]) {
-            current_phase = Some(extract_section_body(rest));
+            current_phase = Some(canonicalize_phase(&extract_section_body(rest)));
         } else if let Some(rest) = match_section_title(section, &[
             "Active Tasks", "关键任务", "当前任务", "任务",
         ]) {
@@ -410,6 +410,59 @@ pub fn render_traps(traps: &[Trap]) -> String {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
+/// Normalize a phase string to its canonical short identifier.
+///
+/// Maps known Chinese and verbose English variants to the SOP §5 canonical set:
+/// `explore`, `plan`, `implement`, `verify`, `complete`.
+///
+/// Already-canonical strings are returned unchanged.  Unknown inputs pass
+/// through with a warning logged to stderr, so the system degrades
+/// gracefully rather than rejecting novel phases.
+pub fn canonicalize_phase(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Already canonical — fast path, no allocation.
+    match trimmed {
+        "explore" | "plan" | "implement" | "verify" | "complete" => {
+            return trimmed.to_string()
+        }
+        _ => {}
+    }
+
+    let lower = trimmed.to_lowercase();
+
+    // ── Chinese → canonical ────────────────────────────────────
+    #[allow(clippy::match_single_binding)]
+    match lower.as_str() {
+        "探索模式" | "探索" => return "explore".to_string(),
+        "规划" | "计划" | "架构设计" => return "plan".to_string(),
+        "执行模式" | "实施" | "实现" | "开发" | "开发中" | "开发阶段" => return "implement".to_string(),
+        "验证" | "测试" | "校验" => return "verify".to_string(),
+        "完成" | "交付" => return "complete".to_string(),
+        _ => {}
+    }
+
+    // ── English verbose → canonical ───────────────────────────
+    match lower.as_str() {
+        "exploration" | "divergence" => return "explore".to_string(),
+        "planning" | "architecture design" => return "plan".to_string(),
+        "execution mode" | "execution" | "implementation" => {
+            return "implement".to_string()
+        }
+        "testing" | "verification" | "validation" => return "verify".to_string(),
+        "delivered" | "completion" | "done" => return "complete".to_string(),
+        _ => {}
+    }
+
+    // ── Unknown: warn, but pass through (graceful degradation) ─
+    eprintln!(
+        "[memguard] WARNING: unknown phase '{}' — using as-is. \
+         Canonical phases are: explore, plan, implement, verify, complete.",
+        trimmed
+    );
+    trimmed.to_string()
+}
+
 /// Extract the body text after a section header (skip header line, trim).
 fn extract_section_body(rest: &str) -> String {
     rest.lines()
@@ -524,7 +577,7 @@ mod tests {
     fn test_parse_context_minimal() {
         let md = "# Current Phase\nplanning\n\n# Active Tasks\n\n# Constraints\n";
         let state = parse_context(md).unwrap();
-        assert_eq!(state.current_phase, "planning");
+        assert_eq!(state.current_phase, "plan");
         assert!(state.active_tasks.is_empty());
         assert!(state.constraints.is_empty());
     }
@@ -543,7 +596,7 @@ mod tests {
             "- No ORM allowed\n"
         );
         let state = parse_context(md).unwrap();
-        assert_eq!(state.current_phase, "implementation");
+        assert_eq!(state.current_phase, "implement");
         assert_eq!(state.active_tasks.len(), 3);
         assert_eq!(state.active_tasks[0].description, "Add login page");
         assert!(matches!(state.active_tasks[0].status, TaskStatus::Todo));
@@ -579,7 +632,7 @@ mod tests {
             "- 不允许使用 ORM\n"
         );
         let state = parse_context(md).unwrap();
-        assert_eq!(state.current_phase, "执行模式");
+        assert_eq!(state.current_phase, "implement");
         assert_eq!(state.active_tasks.len(), 2);
         assert_eq!(state.active_tasks[0].description, "任务一");
         assert!(matches!(state.active_tasks[0].status, TaskStatus::Todo));
@@ -604,7 +657,7 @@ mod tests {
             "- Limit memory\n"
         );
         let state = parse_context(md).unwrap();
-        assert_eq!(state.current_phase, "planning");
+        assert_eq!(state.current_phase, "plan");
         assert_eq!(state.active_tasks.len(), 2);
         assert_eq!(state.active_tasks[0].description, "Modern task");
         assert_eq!(state.active_tasks[1].description, "Legacy task");

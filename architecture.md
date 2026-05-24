@@ -59,7 +59,7 @@ src/                           # 源代码
 
 ```
 RuntimeState
-├── current_phase: String          # e.g. "planning", "implementation"
+├── current_phase: String          # canonical: "explore"|"plan"|"implement"|"verify"|"complete" (normalized from Chinese/verbose variants)
 ├── active_tasks: Vec<Task>        # 当前活跃任务列表
 └── constraints: Vec<String>       # 架构约束条件
 
@@ -146,7 +146,7 @@ Tier 4: CLI 参数 args[1]
 | Struct → Markdown | `render_decisions()` | `decisions.md` |
 | Struct → Markdown | `render_traps()` | `traps.md` |
 
-解析层使用 `regex` 做结构化行匹配；格式错误的条目会被跳过并输出 warning。
+解析层使用 `regex` 做结构化行匹配；`canonicalize_phase()` 将中文、冗长英文等变体自动规范化为 SOP §5 的 5 个 canonical ID（`explore` / `plan` / `implement` / `verify` / `complete`），未知 phase 透传并记录 warning。格式错误的条目会被跳过并输出 warning。
 
 ### 4.4 `mcp/server.rs` — MCP 协议层
 
@@ -254,7 +254,8 @@ flush 任务（每个周期）:
 ```
 1. Agent 调用 runtime_bootstrap
    ├─ (可选) 传入 project_root → switch_project → bootstrap
-   └─ 返回当前 phase / tasks / latest ADR / constraints
+   └─ 返回当前 phase / constraints / latest_adr / adr_count / trap_count / active_tasks
+      （输出顺序：决策与约束在前，任务在后，防止偏向 task management）
 2. Agent 调用 runtime_query_memory
    └─ 关键词匹配 → 按分数排序 → 返回截断摘要
 3. Agent 写代码 / 做决策

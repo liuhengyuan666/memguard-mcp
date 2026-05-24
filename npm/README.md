@@ -17,7 +17,8 @@
 
 - **Thread-Safe Concurrency (`RwLock`)**: Prevents data race conditions or state file corruption when multi-agent swarms or parallel reasoning paths access the project simultaneously.
 - **500ms Write Debouncing**: Groups aggressive, high-frequency agent thought logs into atomic file writes, mitigating disk I/O chokepoints.
-- **Parse Guard Protection**: Detects old-format `memory/*.md` files and prevents empty-state overwrites during flush cycles, preserving legacy content until the user explicitly migrates.
+- **Phase Canonicalization**: Normalizes Chinese (`执行模式`), verbose English (`planning`), and legacy phase strings to SOP-canonical short identifiers (`explore`, `plan`, `implement`, `verify`, `complete`), ensuring agent mode-switching logic is never broken by non-standard phase names.
+- **ADR-Driven Continuity**: Bootstrap output surfaces `adr_count` and `trap_count` signals, ordering architectural decisions and constraints before task lists so agents prioritize project continuity over task management.
 
 ---
 
@@ -49,8 +50,8 @@ Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 3 atomic capabiliti
 
 | Tool | Function | Key Parameters |
 |---|---|---|
-| `runtime_bootstrap` | Reads `memory/*.md`, rebuilds cache, returns compressed runtime summary | `project_root` (optional) |
-| `runtime_commit_event` | Unified state change entrypoint: TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged | `event_type` + `payload` |
+| `runtime_bootstrap` | Reads `memory/*.md`, rebuilds cache, returns summary with phase, constraints, `adr_count`/`trap_count`, latest ADR, active tasks (in priority order) | `project_root` (optional) |
+| `runtime_commit_event` | Unified state change entrypoint: TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged (phase names are auto-canonicalized) | `event_type` + `payload` |
 | `runtime_query_memory` | Keyword search over decisions and traps | `query_intent` (required), `limit` (optional, default 3) |
 
 > Agent **should not** call these tools directly — the Skill layer (SKILL.md) tells the Agent *when* to invoke them. See the companion [memguard Skill](https://github.com/liuhengyuan666/memguard) for the SOP.

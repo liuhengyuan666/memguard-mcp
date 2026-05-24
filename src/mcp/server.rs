@@ -1,3 +1,4 @@
+use crate::engine::projection::canonicalize_phase;
 use crate::engine::state_manager::{AdrError, StateManager};
 use crate::models::{RuntimeEvent, TaskStatus};
 use anyhow::{Context, Result};
@@ -286,7 +287,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.1.3"
+                "version": "0.2.0"
             }
         }))
     }
@@ -422,6 +423,10 @@ impl McpServer {
 
         let state = self.state_manager.state.read().await;
         let decisions = self.state_manager.decisions.read().await;
+        let traps = self.state_manager.traps.read().await;
+
+        let adr_count = decisions.len();
+        let trap_count = traps.len();
 
         let latest_adr = decisions.last().map(|a| {
             serde_json::json!({
@@ -443,14 +448,19 @@ impl McpServer {
             })
             .collect();
 
+        // Order: decisions & constraints first, tasks last.
+        // This prevents the bootstrap output from biasing toward
+        // task-management over architectural continuity.
         Ok(serde_json::json!({
             "content": [{
                 "type": "text",
                 "text": serde_json::to_string_pretty(&serde_json::json!({
                     "current_phase": state.current_phase,
-                    "active_tasks": tasks,
-                    "latest_adr": latest_adr,
                     "constraints": state.constraints,
+                    "latest_adr": latest_adr,
+                    "adr_count": adr_count,
+                    "trap_count": trap_count,
+                    "active_tasks": tasks,
                 })).unwrap_or_default()
             }]
         }))
@@ -673,7 +683,7 @@ fn parse_event(event_type: &str, payload: &Value) -> Result<RuntimeEvent, McpErr
                 .ok_or_else(|| {
                     McpError::InvalidParams("Missing new_phase".into())
                 })?;
-            Ok(RuntimeEvent::PhaseChanged(phase.to_string()))
+            Ok(RuntimeEvent::PhaseChanged(canonicalize_phase(phase)))
         }
         other => Err(McpError::InvalidParams(format!(
             "Unknown event_type: {}",
