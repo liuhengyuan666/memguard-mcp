@@ -1,17 +1,25 @@
----
-name: memguard
-description: Structured memory management and behavioral runtime contract via MCP. Provides context continuity, ADR-based decision anchoring, and controlled Explore → Execution workflows backed by a Git-native Rust runtime.
-version: 3.0.0
-compatibility: opencode
-mcp:
-  server: memguard
----
+# MemGuard MCP — Quick Tool Reference
 
-# MemGuard v3 — Agent SOP Reference
-
-> **This file is a brief reference.** The full Agent SOP (Standard Operating Procedure)
-> is maintained in the [memguard Skill repository](https://github.com/liuhengyuan666/memguard)
-> as `SKILL.md`. Always use the latest version from there.
+> ⛔ **THIS IS NOT THE SKILL FILE.**
+>
+> This is a human-readable reference card for the MCP server. It does **NOT**
+> provide Agent behavior rules or Standard Operating Procedures.
+>
+> **The Agent SOP (behavioral contract) lives at:**
+> https://github.com/liuhengyuan666/memguard/blob/main/memguard/SKILL.md
+>
+> To install the Skill, add this alongside the `mcp` entry in your
+> `opencode.json`:
+>
+> ```json
+> {
+>   "skills": {
+>     "urls": [
+>       "https://raw.githubusercontent.com/liuhengyuan666/memguard/main/"
+>     ]
+>   }
+> }
+> ```
 
 ---
 

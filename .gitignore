@@ -1,5 +1,9 @@
 /target
 
+# Build artifacts
+*.zip
+*.tar.gz
+
 # MemGuard runtime cache (derived from memory/*.md)
 .memguard/
 

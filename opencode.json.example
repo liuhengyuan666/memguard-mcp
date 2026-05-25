@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "memguard": {
+      "type": "local",
+      "command": ["npx", "-y", "@henry_lhy/memguard-mcp"],
+      "enabled": true
+    }
+  },
+  "skills": {
+    "urls": [
+      "https://raw.githubusercontent.com/liuhengyuan666/memguard/main/"
+    ]
+  }
+}

@@ -345,5 +345,5 @@ flush 任务（每个周期）:
 | `src/engine/projection.rs` | ~561 | Markdown ↔ Rust 双向转换 + 18 个单元测试 |
 | `src/mcp/server.rs` | ~700 | MCP JSON-RPC 2.0、工具路由、initialize 自动修正 |
 | `build.ps1` | ~90 | 一键构建 + 安装配置指南 |
-| `memguard.md` | ~109 | Agent Skill 规范（面向 LLM 的运行时契约） |
+| `QUICKREF.md` | ~40 | MCP 工具快速参考（非 Skill 文件） |
 | `blueprint.md` | ~154 | 原始架构蓝图（设计阶段产物） |

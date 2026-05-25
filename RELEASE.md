@@ -69,7 +69,7 @@ Check and update if the changes affect them:
 | `README.md` | Tool spec changes, new capabilities |
 | `npm/README.md` | **Must** stay in sync with root `README.md` |
 | `architecture.md` | Architecture-level changes (data model, module responsibilities) |
-| `memguard.md` | New SOP-level patterns (rare) |
+| `QUICKREF.md` | New SOP-level patterns (rare) |
 | `RELEASE.md` | If the release process itself changed |
 
 ### 4. Commit

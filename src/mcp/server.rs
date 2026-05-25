@@ -287,7 +287,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.2.0"
+                "version": "0.2.1"
             }
         }))
     }

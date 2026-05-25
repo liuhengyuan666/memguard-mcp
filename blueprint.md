@@ -151,4 +151,4 @@ pub enum RuntimeEvent {
   4. 实现 tools/call 路由，将参数反序列化后交给 state_manager 处理。
 - **Sprint 4: 打包与集成 (Integration)**
   1. 提供一键编译构建脚本。
-  2. 输出最终极简版的 memguard.md Skill 提示词，以便挂载至系统。
+  2. 提供 QUICKREF.md 工具参考 + 独立 Skill 仓库（https://github.com/liuhengyuan666/memguard）的 SOP 挂载指南（v3 架构变更）。

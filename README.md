@@ -89,6 +89,57 @@ Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 3 atomic capabiliti
 
 ---
 
+## ❓ Troubleshooting
+
+### Agent says `Skill "memguard" not found`
+
+You installed the MCP runtime (`memguard-mcp`) but **not** the Skill (the Agent
+SOP). The Skill is a separate behavioral contract that tells the Agent WHEN and
+HOW to call the MCP tools.
+
+Add this to your project's `opencode.json` alongside the `mcp` entry:
+
+```json
+{
+  "skills": {
+    "urls": [
+      "https://raw.githubusercontent.com/liuhengyuan666/memguard/main/"
+    ]
+  }
+}
+```
+
+Then restart OpenCode. See the [memguard Skill
+repository](https://github.com/liuhengyuan666/memguard) for complete installation
+instructions.
+
+### MCP returns `MCP error -32602: Missing new_status`
+
+The Agent is calling `memguard_runtime_commit_event` without the Skill's SOP
+guidance. Without the Skill, the Agent guesses payload field names and often
+gets them wrong.
+
+**Fix**: Install the Skill (above), then restart the session. With the Skill
+installed, the Agent follows the SOP and uses correct payload fields:
+- `TaskUpdated`: use `task_id` + `new_status` (values: `Todo` | `InProgress` | `Done`)
+- `AdrCommitted`: include all 6 fields (`id`, `title`, `status`, `context`, `decision`, `tags`)
+
+### MCP returns `MCP error -32602: Invalid ADR payload`
+
+Same root cause: Agent without Skill guidance. The `AdrCommitted` event requires
+a complete ADR object with all fields: `{ id, title, status, context, decision, tags }`.
+
+Install the Skill to provide the Agent with correct payload schemas.
+
+### Quick Verification Checklist
+
+- [ ] `opencode.json` has `mcp.memguard` entry (MCP runtime)
+- [ ] `opencode.json` has `skills.urls` pointing to memguard repo (Agent SOP)
+- [ ] Restarted OpenCode after configuration changes
+- [ ] Agent called `memguard_runtime_bootstrap` successfully at session start
+
+---
+
 ## 📐 Memory Layout
 
 ```text
