@@ -10,7 +10,7 @@
 Release is fully automated via GitHub Actions (`.github/workflows/release.yml`). Pushing a `v*` tag triggers:
 
 ```
-push tag → build 5 platforms → upload release assets → npm publish
+push tag → build 4 platforms → upload release assets → npm publish
 ```
 
 The npm package (`@henry_lhy/memguard-mcp`) is a thin wrapper (`cli.js` + `install.js`) that downloads the correct platform binary from GitHub Releases. **Binary changes are distributed via Release assets, not inside the npm tarball.**
@@ -119,7 +119,6 @@ Push 后自动触发。去 [Actions](https://github.com/liuhengyuan666/memguard-
 |-----|-------------|
 | `build (windows-x64)` | Compile + test + zip → attach to Release |
 | `build (darwin-arm64)` | Compile + test + tar.gz → attach to Release |
-| `build (darwin-x64)` | Compile + test + tar.gz → attach to Release |
 | `build (linux-x64)` | Compile + test + tar.gz → attach to Release |
 | `build (linux-arm64)` | Compile (cross) + tar.gz → attach to Release |
 | `publish-npm` | `cd npm && npm publish` (runs only after **ALL** builds pass) |
@@ -190,7 +189,6 @@ gh release create v3.0.X --repo liuhengyuan666/memguard \
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | `npm publish` fails — "cannot publish over previously published version" | Previous workflow run already published this npm version | If `cli.js`/`install.js` didn't change: **ignore the red badge** — binary Release is what matters. If they did change: bump patch version + re-tag. |
-| macOS x86_64 build stuck in queue | `macos-13` runner capacity on GitHub Actions | Wait. If >30 min, it's a capacity issue. The Release is usable with the 4 other platforms; re-run the failed job later from the Actions UI. |
 | Tag already exists locally | Previous release used same version number | See Step 6 re-tag instructions |
 | `serverInfo.version` mismatch | Forgot to update `src/mcp/server.rs` | Run the version confirmation grep from Step 5 |
 | Partial release (some builds failed) | Code bug or transient CI issue | Follow Step 8 recovery procedure |
@@ -212,8 +210,8 @@ gh release create v3.0.X --repo liuhengyuan666/memguard \
 [ ] Docs updated if needed (README, npm/README, architecture.md)
 [ ] Commit message follows conventional format
 [ ] Tag created and pushed
-[ ] GitHub Actions: all 5 builds green (or known macOS runner queue)
-[ ] GitHub Release shows 5 platform assets
+[ ] GitHub Actions: all 4 builds green
+[ ] GitHub Release shows 4 platform assets
 [ ] npm registry shows new version
 [ ] Companion memguard SKILL.md updated (if needed)
 ```

@@ -24,7 +24,6 @@ const BINARY_BASE = "memguard-mcp";
 const TARGET_MAP = {
   "win32-x64":   { rustTarget: "x86_64-pc-windows-msvc",  ext: ".exe", archiveExt: ".zip" },
   "darwin-arm64": { rustTarget: "aarch64-apple-darwin",    ext: "",      archiveExt: ".tar.gz" },
-  "darwin-x64":   { rustTarget: "x86_64-apple-darwin",     ext: "",      archiveExt: ".tar.gz" },
   "linux-x64":    { rustTarget: "x86_64-unknown-linux-gnu", ext: "",      archiveExt: ".tar.gz" },
   "linux-arm64":  { rustTarget: "aarch64-unknown-linux-gnu", ext: "",     archiveExt: ".tar.gz" },
 };

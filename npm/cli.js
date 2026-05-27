@@ -17,7 +17,6 @@ const os = require("os");
 const PLATFORM_MAP = {
   "win32-x64":   "memguard-mcp.exe",
   "darwin-arm64": "memguard-mcp",
-  "darwin-x64":   "memguard-mcp",
   "linux-x64":    "memguard-mcp",
   "linux-arm64":  "memguard-mcp",
 };
