@@ -287,7 +287,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.2.1"
+                "version": "0.2.2"
             }
         }))
     }
@@ -428,13 +428,17 @@ impl McpServer {
         let adr_count = decisions.len();
         let trap_count = traps.len();
 
-        let latest_adr = decisions.last().map(|a| {
-            serde_json::json!({
-                "id": a.id,
-                "title": a.title,
-                "status": a.status,
-            })
-        });
+        let latest_adr = decisions
+            .iter()
+            .rev()
+            .find(|a| a.status == "active" || a.status == "proposed")
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id,
+                    "title": a.title,
+                    "status": a.status,
+                })
+            });
 
         let tasks: Vec<Value> = state
             .active_tasks
@@ -1040,5 +1044,43 @@ mod tests {
 
         assert_eq!(results.len(), 1, "only trap should be returned");
         assert_eq!(results[0]["type"], "Trap", "traps must not be affected by ADR stale filter");
+    }
+
+    #[tokio::test]
+    async fn test_latest_adr_prefers_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::new(dir.path().to_path_buf());
+
+        // Inject ADR-001 active, then ADR-002 superseded.
+        // If latest_adr used decisions.last(), it would return ADR-002.
+        {
+            let mut decisions = sm.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Active Choice".into(),
+                status: "active".into(),
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec!["a".into()],
+            });
+            decisions.push(ADR {
+                id: "ADR-002".into(),
+                title: "Superseded Choice".into(),
+                status: "superseded".into(),
+                context: "old".into(),
+                decision: "old dec".into(),
+                tags: vec![],
+            });
+        }
+
+        let server = McpServer::new(Arc::new(sm));
+        let args = serde_json::json!({});
+        let resp = server.tool_runtime_bootstrap(args).await.unwrap();
+        let text = resp["content"][0]["text"].as_str().unwrap_or("{}");
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        let latest = parsed["latest_adr"].as_object().expect("latest_adr should exist");
+        assert_eq!(latest["id"], "ADR-001", "latest_adr should be active, not last in Vec");
+        assert_eq!(latest["status"], "active");
     }
 }

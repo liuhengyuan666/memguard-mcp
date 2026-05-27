@@ -335,34 +335,42 @@ impl StateManager {
                 let mut decisions = self.decisions.write().await;
                 let new_hash = content_hash(&adr);
 
-                // Check for existing ADR with the same id.
-                if let Some(existing) = decisions.iter().find(|a| a.id == adr.id) {
-                    let existing_hash = content_hash(existing);
-
-                    match existing.status.as_str() {
-                        "active" => {
-                            if new_hash == existing_hash {
-                                // Idempotent: same content, silently ignore.
-                                drop(decisions);
-                                let _ = self.flush_tx.send(());
-                                return Ok(());
-                            }
-                            return Err(AdrError::ActiveConflict {
-                                id: adr.id,
-                                existing_title: existing.title.clone(),
-                                new_title: adr.title,
-                            }
-                            .into());
-                        }
-                        "rejected" => {
-                            if new_hash == existing_hash {
-                                return Err(AdrError::RejectedRepeat { id: adr.id }.into());
-                            }
-                            // Different content: allow (fall through to supersede + push).
-                        }
-                        // superseded, deprecated, conflict, or any other status: allow.
-                        _ => {}
+                // Check ALL existing ADRs with the same ID for conflict.
+                // A single Vec may contain multiple entries for the same ID
+                // (e.g., after bootstrap loads both decisions.md and archive).
+                let mut active_adr: Option<&ADR> = None;
+                let mut rejected_adr: Option<&ADR> = None;
+                for existing in decisions.iter().filter(|a| a.id == adr.id) {
+                    if existing.status == "active" && active_adr.is_none() {
+                        active_adr = Some(existing);
                     }
+                    if existing.status == "rejected" && rejected_adr.is_none() {
+                        rejected_adr = Some(existing);
+                    }
+                }
+
+                if let Some(active) = active_adr {
+                    let active_hash = content_hash(active);
+                    if new_hash == active_hash {
+                        // Idempotent: same content, silently ignore.
+                        drop(decisions);
+                        let _ = self.flush_tx.send(());
+                        return Ok(());
+                    }
+                    return Err(AdrError::ActiveConflict {
+                        id: adr.id,
+                        existing_title: active.title.clone(),
+                        new_title: adr.title,
+                    }
+                    .into());
+                }
+
+                if let Some(rejected) = rejected_adr {
+                    let rejected_hash = content_hash(rejected);
+                    if new_hash == rejected_hash {
+                        return Err(AdrError::RejectedRepeat { id: adr.id }.into());
+                    }
+                    // Different content: fall through to supersede + push.
                 }
 
                 // No conflict: mark all existing versions as superseded, then push new.
@@ -618,6 +626,40 @@ async fn load_state_from_disk(
             }
         }
     }
+
+    // Deduplicate by ID: keep the entry with the highest-priority status.
+    // This prevents duplicate ADR entries when bootstrap loads both
+    // decisions.md (active) and decisions_archive.md (superseded).
+    fn adr_status_priority(s: &str) -> u8 {
+        match s {
+            "active" => 5,
+            "proposed" => 4,
+            "rejected" => 3,
+            "superseded" => 2,
+            "deprecated" => 1,
+            _ => 0,
+        }
+    }
+    let mut best_by_id: std::collections::HashMap<String, ADR> = std::collections::HashMap::new();
+    for adr in decisions {
+        let priority = adr_status_priority(&adr.status);
+        best_by_id
+            .entry(adr.id.clone())
+            .and_modify(|existing| {
+                if priority > adr_status_priority(&existing.status) {
+                    *existing = adr.clone();
+                }
+            })
+            .or_insert(adr);
+    }
+    let mut deduped: Vec<ADR> = best_by_id.into_values().collect();
+    // Sort by priority descending, then by ID ascending for deterministic order.
+    deduped.sort_by(|a, b| {
+        let pa = adr_status_priority(&a.status);
+        let pb = adr_status_priority(&b.status);
+        pb.cmp(&pa).then_with(|| a.id.cmp(&b.id))
+    });
+    decisions = deduped;
 
     decisions_parsed = main_parsed || archive_parsed;
 
@@ -1322,6 +1364,55 @@ old dec
     }
 
     #[tokio::test]
+    async fn test_bootstrap_deduplicates_by_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory_dir = dir.path().join("memory");
+        tokio::fs::create_dir_all(&memory_dir).await.unwrap();
+
+        // decisions.md: ADR-001 active
+        let main_md = r##"## ADR-001: Active Choice
+
+**Status:** active
+
+### Context
+ctx
+
+### Decision
+dec
+
+**Tags:** a
+"##;
+        // archive: ADR-001 superseded (duplicate ID!)
+        let archive_md = r##"## ADR-001: Old Choice
+
+**Status:** superseded
+
+### Context
+old ctx
+
+### Decision
+old dec
+
+**Tags:** old
+"##;
+
+        tokio::fs::write(memory_dir.join("decisions.md"), main_md)
+            .await
+            .unwrap();
+        tokio::fs::write(memory_dir.join("decisions_archive.md"), archive_md)
+            .await
+            .unwrap();
+
+        let mgr = StateManager::new(dir.path().to_path_buf());
+        mgr.bootstrap().await.expect("bootstrap should succeed");
+
+        let decisions = mgr.decisions.read().await;
+        // Should deduplicate ADR-001 to a single entry (active has priority)
+        assert_eq!(decisions.len(), 1, "ADR-001 should be deduplicated");
+        assert_eq!(decisions[0].status, "active", "higher-priority status should win");
+    }
+
+    #[tokio::test]
     async fn test_archive_not_created_when_empty() {
         let (_dir, mgr) = setup_temp_dir();
         mgr.bootstrap().await.unwrap();
@@ -1345,5 +1436,51 @@ old dec
 
         assert!(memory_dir.join("decisions.md").exists());
         assert!(!memory_dir.join("decisions_archive.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_adr_conflict_checks_all_matching_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::new(dir.path().to_path_buf());
+
+        // Manually inject duplicate ADR-001 entries:
+        // first superseded (simulating archive load), then active.
+        {
+            let mut decisions = sm.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Old".into(),
+                status: "superseded".into(),
+                context: "old".into(),
+                decision: "old".into(),
+                tags: vec![],
+            });
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Current".into(),
+                status: "active".into(),
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            });
+        }
+
+        // Attempt to commit a new ADR-001 with different content.
+        let event = RuntimeEvent::AdrCommitted(ADR {
+            id: "ADR-001".into(),
+            title: "New".into(),
+            status: "active".into(),
+            context: "new ctx".into(),
+            decision: "new dec".into(),
+            tags: vec![],
+        });
+        let result = sm.apply_event(event).await;
+
+        assert!(
+            result.is_err(),
+            "should fail with ActiveConflict even when first match is superseded"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.starts_with("[CONFLICT]"), "error should be ActiveConflict: {}", err_msg);
     }
 }
