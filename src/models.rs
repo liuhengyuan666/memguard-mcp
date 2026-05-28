@@ -14,6 +14,14 @@ pub struct Task {
     pub status: TaskStatus,
 }
 
+/// Payload for TaskCreated events — does not include `status` because
+/// new tasks are always created as `Todo` regardless of caller input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCreatePayload {
+    pub id: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ADR {
     pub id: String,
@@ -41,6 +49,7 @@ pub struct RuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum RuntimeEvent {
+    TaskCreated(Task),
     TaskUpdated {
         task_id: String,
         new_status: TaskStatus,

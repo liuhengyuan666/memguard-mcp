@@ -287,7 +287,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.2.2"
+                "version": "0.2.3"
             }
         }))
     }
@@ -317,7 +317,7 @@ impl McpServer {
                         "properties": {
                             "event_type": {
                                 "type": "string",
-                                "enum": ["TaskUpdated", "AdrCommitted", "TrapRecorded", "PhaseChanged"],
+                                "enum": ["TaskCreated", "TaskUpdated", "AdrCommitted", "TrapRecorded", "PhaseChanged"],
                                 "description": "Type of runtime event"
                             },
                             "payload": {
@@ -688,6 +688,20 @@ fn parse_event(event_type: &str, payload: &Value) -> Result<RuntimeEvent, McpErr
                     McpError::InvalidParams("Missing new_phase".into())
                 })?;
             Ok(RuntimeEvent::PhaseChanged(canonicalize_phase(phase)))
+        }
+        "TaskCreated" => {
+            let payload: crate::models::TaskCreatePayload =
+                serde_json::from_value(payload.clone()).map_err(|e| {
+                    McpError::InvalidParams(format!(
+                        "Invalid Task payload: {}",
+                        e
+                    ))
+                })?;
+            Ok(RuntimeEvent::TaskCreated(crate::models::Task {
+                id: payload.id,
+                description: payload.description,
+                status: crate::models::TaskStatus::Todo,
+            }))
         }
         other => Err(McpError::InvalidParams(format!(
             "Unknown event_type: {}",
@@ -1082,5 +1096,37 @@ mod tests {
         let latest = parsed["latest_adr"].as_object().expect("latest_adr should exist");
         assert_eq!(latest["id"], "ADR-001", "latest_adr should be active, not last in Vec");
         assert_eq!(latest["status"], "active");
+    }
+
+    #[test]
+    fn test_parse_event_task_created() {
+        let payload = serde_json::json!({
+            "id": "TASK-011",
+            "description": "New task"
+        });
+        let event = parse_event("TaskCreated", &payload).unwrap();
+        assert!(matches!(event, RuntimeEvent::TaskCreated(_)));
+        if let RuntimeEvent::TaskCreated(task) = event {
+            assert_eq!(task.id, "TASK-011");
+            assert_eq!(task.description, "New task");
+        }
+    }
+
+    #[test]
+    fn test_parse_event_task_created_with_status_ignored() {
+        let payload = serde_json::json!({
+            "id": "TASK-012",
+            "description": "Task with status",
+            "status": "InProgress"
+        });
+        let event = parse_event("TaskCreated", &payload).unwrap();
+        if let RuntimeEvent::TaskCreated(task) = event {
+            assert_eq!(task.id, "TASK-012");
+            assert!(
+                matches!(task.status, crate::models::TaskStatus::Todo),
+                "status should be forced to Todo, got {:?}",
+                task.status
+            );
+        }
     }
 }

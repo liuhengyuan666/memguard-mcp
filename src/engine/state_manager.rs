@@ -331,6 +331,28 @@ impl StateManager {
                 // Lock dropped here (end of scope).
             }
 
+            RuntimeEvent::TaskCreated(task) => {
+                let mut state = self.state.write().await;
+                // Reject empty task IDs.
+                if task.id.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Task ID cannot be empty."
+                    ));
+                }
+                // Reject duplicate task IDs.
+                if state.active_tasks.iter().any(|t| t.id == task.id) {
+                    return Err(anyhow::anyhow!(
+                        "Task with id '{}' already exists. Use TaskUpdated to modify it.",
+                        task.id
+                    ));
+                }
+                // Always start as Todo regardless of caller input.
+                let mut task = task;
+                task.status = TaskStatus::Todo;
+                state.active_tasks.push(task);
+                self.context_ok.store(true, Ordering::Release);
+            }
+
             RuntimeEvent::AdrCommitted(adr) => {
                 let mut decisions = self.decisions.write().await;
                 let new_hash = content_hash(&adr);
@@ -1482,5 +1504,69 @@ old dec
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.starts_with("[CONFLICT]"), "error should be ActiveConflict: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_apply_task_created() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        let event = RuntimeEvent::TaskCreated(Task {
+            id: "TASK-011".into(),
+            description: "New task".into(),
+            status: TaskStatus::Todo,
+        });
+        mgr.apply_event(event).await.unwrap();
+
+        let state = mgr.state.read().await;
+        assert_eq!(state.active_tasks.len(), 1);
+        assert_eq!(state.active_tasks[0].id, "TASK-011");
+        assert_eq!(state.active_tasks[0].description, "New task");
+        assert!(
+            matches!(state.active_tasks[0].status, TaskStatus::Todo),
+            "status should be forced to Todo, got {:?}",
+            state.active_tasks[0].status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_task_created_empty_id() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        let event = RuntimeEvent::TaskCreated(Task {
+            id: "".into(),
+            description: "Invalid task".into(),
+            status: TaskStatus::Todo,
+        });
+        let result = mgr.apply_event(event).await;
+        assert!(result.is_err(), "should reject empty task ID");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cannot be empty"), "error should mention empty ID: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_apply_task_created_duplicate_id() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        // Create first task
+        let event1 = RuntimeEvent::TaskCreated(Task {
+            id: "TASK-011".into(),
+            description: "First task".into(),
+            status: TaskStatus::Todo,
+        });
+        mgr.apply_event(event1).await.unwrap();
+
+        // Attempt duplicate
+        let event2 = RuntimeEvent::TaskCreated(Task {
+            id: "TASK-011".into(),
+            description: "Duplicate task".into(),
+            status: TaskStatus::Todo,
+        });
+        let result = mgr.apply_event(event2).await;
+        assert!(result.is_err(), "should reject duplicate task ID");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("already exists"), "error should mention conflict: {}", err_msg);
     }
 }
