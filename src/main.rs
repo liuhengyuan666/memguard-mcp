@@ -64,7 +64,15 @@ fn resolve_project_root() -> PathBuf {
 #[tokio::main]
 async fn main() {
     // ── CLI subcommand routing ──────────────────────────────────────
-    if std::env::args().nth(1).as_deref() == Some("cleanup") {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --version / -v: print version and exit
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-v") {
+        println!("memguard-mcp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if args.get(1).map(|s| s.as_str()) == Some("cleanup") {
         let args = cli::cleanup::CleanupArgs::parse();
         if let Err(e) = cli::cleanup::run_cleanup(&args) {
             eprintln!("ERROR: {}", e);
