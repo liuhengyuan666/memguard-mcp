@@ -4,10 +4,10 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-black.svg?logo=rust)](https://www.rust-lang.org/)
 
-> **The Muscle for MemGuard v3.**
+> **The Muscle for MemGuard v4.**
 > A Git-Native, thread-safe Model Context Protocol (MCP) server written in Rust.
 
-`MemGuard MCP` is the capability engine behind the MemGuard v3 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees.
+`MemGuard MCP` is the capability engine behind the MemGuard v4 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees. V4 introduces full lifecycle management: automatic archival of completed tasks, ADR state machine with 5 statuses, a Validation Framework, and an inverted search index.
 
 ⚠️ **Crucial Requirement:** This is the execution runtime. To govern *when* and *how* the agent calls these tools, you **must** install the companion behavioral contract: [memguard Core Specification](https://github.com/liuhengyuan666/memguard).
 
@@ -19,6 +19,11 @@
 - **500ms Write Debouncing**: Groups aggressive, high-frequency agent thought logs into atomic file writes, mitigating disk I/O chokepoints.
 - **Phase Canonicalization**: Normalizes Chinese (`执行模式`), verbose English (`planning`), and legacy phase strings to SOP-canonical short identifiers (`explore`, `plan`, `implement`, `verify`, `complete`), ensuring agent mode-switching logic is never broken by non-standard phase names.
 - **ADR-Driven Continuity**: Bootstrap output surfaces `adr_count` and `trap_count` signals, ordering architectural decisions and constraints before task lists so agents prioritize project continuity over task management.
+- **Task Lifecycle Management**: Done tasks are automatically archived to `tasks_archive.md`; `Blocked` status tracks externally-blocked work.
+- **ADR State Machine**: 5 statuses (`Proposed` → `Accepted` → `Superseded`/`Archived`, `Rejected` → `Proposed`) with transition validation.
+- **Validation Framework**: Pre-mutation validation via `ValidatorRegistry` with 5 concrete validators (duplicate task ID, empty ID, ADR conflict, rejected repeat, invalid transition).
+- **Inverted Search Index**: O(1) term-based pre-filtering for `query_memory` with behavioral parity to the legacy brute-force scorer.
+- **Manual Cleanup CLI**: `memguard cleanup --dry-run` scans memory for hygiene issues (stale ADRs, done tasks, duplicates) with backup + interactive confirmation.
 
 ---
 
@@ -121,8 +126,8 @@ gets them wrong.
 
 **Fix**: Install the Skill (above), then restart the session. With the Skill
 installed, the Agent follows the SOP and uses correct payload fields:
-- `TaskUpdated`: use `task_id` + `new_status` (values: `Todo` | `InProgress` | `Done`)
-- `AdrCommitted`: include all 6 fields (`id`, `title`, `status`, `context`, `decision`, `tags`)
+- `TaskUpdated`: use `task_id` + `new_status` (values: `Todo` | `InProgress` | `Blocked` | `Done`)
+- `AdrCommitted`: include all 6 fields (`id`, `title`, `status`, `context`, `decision`, `tags`). `status` accepts `Proposed`, `Accepted`, `Superseded`, `Rejected`, `Archived` (legacy `"active"` maps to `Accepted` for backward compatibility)
 
 ### MCP returns `MCP error -32602: Invalid ADR payload`
 
@@ -144,14 +149,22 @@ Install the Skill to provide the Agent with correct payload schemas.
 
 ```text
 [Project Root]
-├── memory/                  # Source of Truth (Human Readable, Git Committed)
-│   ├── context.md           # Active phase, goals, current tasks, and constraints
-│   ├── decisions.md         # Architecture Decision Records (ADR, Append-Only)
-│   └── traps.md             # Error signatures, context, and solutions
+├── memory/                        # Source of Truth (Human Readable, Git Committed)
+│   ├── context.md                 # Active phase, goals, current tasks, and constraints
+│   ├── decisions.md               # Active ADRs (Accepted / Proposed)
+│   ├── traps.md                   # Error signatures, context, and solutions
+│   ├── tasks_archive.md           # Historical completed tasks (auto-generated)
+│   └── decisions_archive.md       # Historical stale ADRs (auto-generated)
 │
-└── .memguard/               # Runtime Cache (Machine Readable, add to .gitignore)
-    ├── runtime_state.json   # Serialized state graph for concurrent validation
-    └── search_index.json    # Lightweight keyword index for instant retrieval
+└── .memguard/                     # Runtime Cache (Machine Readable, add to .gitignore)
+    ├── runtime_state.json         # Serialized state graph for concurrent validation
+    ├── search_index.json          # Inverted keyword index for instant retrieval
+    └── backups/                   # Manual cleanup snapshots (YYYYMMDD-HHMMSS/)
+        ├── context.md
+        ├── decisions.md
+        ├── runtime_state.json
+        ├── search_index.json
+        └── manifest.json
 ```
 
 ---
