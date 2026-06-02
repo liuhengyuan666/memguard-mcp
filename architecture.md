@@ -1,7 +1,7 @@
 # MemGuard v3 — Architecture & Design Reference
 
 > **Runtime**: Rust MCP Server · Git-native · RwLock thread-safe · Source-of-Truth in Markdown
-> **Version**: 0.1.0 (core) / 3.0.0 (spec)
+> **Version**: 0.3.0 (core) / 4.0.0 (spec)
 > **Compatibility**: OpenCode MCP client
 
 ---
@@ -27,12 +27,15 @@ MemGuard 在每个宿主项目根目录下接管以下文件结构：
 [Host Project Root]/           # ← 动态确定的项目根目录
 ├── memory/                    # Source of Truth（人类可读，随 Git 提交）
 │   ├── context.md             # 当前阶段、活跃任务、约束条件
-│   ├── decisions.md           # ADR 格式的架构决策记录（追加式）
-│   └── traps.md               # 踩坑记录：错误签名 + 上下文 + 解决方案
+│   ├── decisions.md           # 活跃 ADR（Accepted / Proposed）
+│   ├── traps.md               # 踩坑记录：错误签名 + 上下文 + 解决方案
+│   ├── tasks_archive.md       # 历史已完成任务（自动归档）
+│   └── decisions_archive.md   # 历史失效 ADR（自动归档）
 │
 └── .memguard/                 # Runtime Cache（机器可读，应被 .gitignore）
     ├── runtime_state.json     # 完整内存状态快照
-    └── search_index.json      # ADR / Trap 的轻量关键词索引
+    ├── search_index.json      # 倒排关键词索引（v4 inverted index）
+    └── backups/               # Cleanup 手动备份（YYYYMMDD-HHMMSS/）
 ```
 
 **隔离子目录**（不随 Git 提交）：
@@ -40,12 +43,27 @@ MemGuard 在每个宿主项目根目录下接管以下文件结构：
 ```
 target/                        # Rust 编译产物
 src/                           # 源代码
-  ├── main.rs                  # 入口点 + 路径解析
-  ├── models.rs                # 领域数据模型
+  ├── main.rs                  # 入口点 + 路径解析 + CLI 子命令路由
+  ├── models.rs                # 领域数据模型（V4：AdrStatus 5 状态 + Trap 扩展）
+  ├── cli/
+  │   ├── mod.rs
+  │   └── cleanup.rs           # memguard cleanup 手动迁移工具
   ├── engine/
   │   ├── mod.rs
-  │   ├── state_manager.rs     # 状态机 + 防抖写入 + 项目切换
-  │   └── projection.rs        # Markdown ↔ Rust 双向转换
+  │   ├── state_manager.rs     # 状态机 + 防抖写入 + 项目切换 + ADR 状态机
+  │   ├── projection.rs        # Markdown ↔ Rust 双向转换
+  │   ├── validator.rs         # Validator trait + Registry
+  │   └── validators/          # 5 个具体验证器
+  │       ├── mod.rs
+  │       ├── empty_task_id.rs
+  │       ├── duplicate_task_id.rs
+  │       ├── adr_active_conflict.rs
+  │       ├── adr_rejected_repeat.rs
+  │       └── adr_invalid_transition.rs
+  ├── search/
+  │   ├── mod.rs
+  │   ├── scorer.rs            # score_match_v3 + ngram_jaccard
+  │   └── index.rs             # SearchIndex + Inverted Index
   └── mcp/
       ├── mod.rs
       └── server.rs            # MCP JSON-RPC 2.0 协议层
@@ -59,24 +77,34 @@ src/                           # 源代码
 
 ```
 RuntimeState
-├── current_phase: String          # canonical: "explore"|"plan"|"implement"|"verify"|"complete" (normalized from Chinese/verbose variants)
-├── active_tasks: Vec<Task>        # 当前活跃任务列表
+├── current_phase: String          # canonical: "explore"|"plan"|"implement"|"verify"|"complete"
+├── active_tasks: Vec<Task>        # 当前活跃任务列表（Done 已过滤）
+├── done_tasks: Vec<Task>          # 待归档任务（flush 时写入 tasks_archive.md）
 └── constraints: Vec<String>       # 架构约束条件
 
 Task
 ├── id: String                     # e.g. "TASK-000"
 ├── description: String
-└── status: TaskStatus             # Todo | InProgress | Done
+└── status: TaskStatus             # Todo | InProgress | Blocked | Done
 
 ADR (Architecture Decision Record)
-├── id, title, status              # status: active | superseded
+├── id, title, status              # status: AdrStatus 枚举（5 变体）
 ├── context, decision              # 自由文本 Markdown
 └── tags: Vec<String>              # e.g. ["rust", "backend"]
+
+AdrStatus (enum, custom serde)
+├── Proposed  → "Proposed"
+├── Accepted  → "Accepted"（legacy "active" 反序列化为 Accepted）
+├── Superseded → "Superseded"
+├── Rejected  → "Rejected"
+└── Archived  → "Archived"
 
 Trap
 ├── error_signature: String        # e.g. "NPE in auth handler"
 ├── context: String                # 触发语境
-└── solution: String               # 修复方案
+├── solution: String               # 修复方案
+├── root_cause: String             # 根因分析（V4 新增）
+└── prevention: String             # 预防措施（V4 新增）
 
 RuntimeEvent (enum, serde tagged)
 ├── TaskUpdated { task_id, new_status }
@@ -124,9 +152,10 @@ Tier 4: CLI 参数 args[1]
 | 方法 | 行为 |
 |---|---|
 | `bootstrap()` | 读取 `memory/*.md` → 解析 → 填充内存；若目录不存在则创建默认文件 |
-| `apply_event(event)` | 加写锁 → 修改内存状态 → 释放锁 → 发送防抖信号 |
+| `apply_event(event)` | **ValidatorRegistry 预校验** → 加写锁 → 修改内存状态 → 释放锁 → 发送防抖信号 |
 | `flush_now()` | 立即强制写入所有 Markdown + JSON（bypass 防抖） |
 | `switch_project(new_root)` | **flush_now()** → bump generation → 更新 root → 清空状态 → **bootstrap()** |
+| `valid_transitions(status)` | ADR 状态机：返回给定状态的合法下一状态集合 |
 
 **防抖写入（Debounced Flush）**：
 - `apply_event` 不直接写磁盘，只向 `mpsc::unbounded_channel` 发送信号
@@ -140,13 +169,14 @@ Tier 4: CLI 参数 args[1]
 | 方向 | 函数 | Markdown 文件 |
 |---|---|---|
 | Markdown → Struct | `parse_context()` | `context.md` |
-| Markdown → Struct | `parse_decisions()` | `decisions.md` |
+| Markdown → Struct | `parse_decisions()` | `decisions.md` + `decisions_archive.md` |
 | Markdown → Struct | `parse_traps()` | `traps.md` |
-| Struct → Markdown | `render_context()` | `context.md` |
-| Struct → Markdown | `render_decisions()` | `decisions.md` |
-| Struct → Markdown | `render_traps()` | `traps.md` |
+| Struct → Markdown | `render_context()` | `context.md`（自动过滤 Done tasks） |
+| Struct → Markdown | `render_decisions()` | `decisions.md`（按状态分区：活跃 vs 归档） |
+| Struct → Markdown | `render_traps()` | `traps.md`（支持 Root Cause / Prevention 章节） |
+| Struct → Markdown | `append_tasks_archive()` | `tasks_archive.md`（按日期分组，全局 ID 去重） |
 
-解析层使用 `regex` 做结构化行匹配；`canonicalize_phase()` 将中文、冗长英文等变体自动规范化为 SOP §5 的 5 个 canonical ID（`explore` / `plan` / `implement` / `verify` / `complete`），未知 phase 透传并记录 warning。格式错误的条目会被跳过并输出 warning。
+解析层使用 `regex` 做结构化行匹配；`canonicalize_phase()` 自动规范化 phase 名称。格式错误的条目会被跳过并输出 warning。
 
 ### 4.4 `mcp/server.rs` — MCP 协议层
 
@@ -162,12 +192,87 @@ Tier 4: CLI 参数 args[1]
 
 | Tool | 参数 | 行为 |
 |---|---|---|
-| `runtime_bootstrap` | `project_root?` (string, 可选) | 切换项目 → bootstrap → 返回压缩摘要 |
-| `runtime_commit_event` | `event_type` + `payload` | 反序列化 `RuntimeEvent` → `apply_event` |
-| `runtime_query_memory` | `query_intent` + `limit?` | 对 ADR / Trap 做关键词匹配，按分数排序 |
+| `runtime_bootstrap` | `project_root?` (string, 可选) | 切换项目 → bootstrap → 返回压缩摘要（含 `adr_count`/`trap_count`） |
+| `runtime_commit_event` | `event_type` + `payload` | 反序列化 `RuntimeEvent` → `ValidatorRegistry` 预校验 → `apply_event` |
+| `runtime_query_memory` | `query_intent` + `limit?` + `include_stale?` | 通过 `SearchIndex` 倒排索引预过滤 → `score_match_v3` 评分 → 按分数排序 |
+
+**查询行为**（V4）：
+- 默认只搜索 `Accepted` / `Proposed` ADR；`include_stale=true` 时返回全部
+- Trap 结果包含 `root_cause` + `prevention` 字段
+- ADR 非活跃状态（Superseded/Rejected/Archived）匹配时分数 × 0.3
 
 **`initialize` 握手自动修正**：
 当客户端在 `initialize` 请求中声明 `workspaceFolders` 或 `rootUri` 与当前 `project_root` 不一致时，服务器不再只输出警告，而是直接调用 `StateManager::switch_project()` 修正到正确目录。这解决了 "exe 放在目录 A，项目在目录 B" 的经典部署场景。
+
+---
+
+### 4.5 `engine/validator.rs` + `validators/` — Validation Framework
+
+**职责**：在 `apply_event` 修改内存状态之前，通过 `ValidatorRegistry` 进行同步预校验，失败时返回结构化错误并阻止 mutation。
+
+| 组件 | 职责 |
+|---|---|
+| `trait Validator` | 定义 `validate(event, state, decisions, traps) -> Result<(), ValidationError>` |
+| `ValidationError` | 包含 `validator_name`、`message`、`suggestion` |
+| `ValidatorRegistry` | 持有 `Vec<Box<dyn Validator>>`，提供 `validate_all()`（短路：第一个错误即返回） |
+
+**5 个内置验证器**：
+
+| 验证器 | 检测内容 |
+|---|---|
+| `EmptyTaskId` | `TaskCreated` 的 `id` 为空字符串 |
+| `DuplicateTaskId` | `TaskCreated` 的 `id` 已在 `active_tasks` 中存在 |
+| `AdrActiveConflict` | 同 ID 的 `Accepted` ADR 已存在且内容不同 |
+| `AdrRejectedRepeat` | 同 ID 的 `Rejected` ADR 已存在且内容完全相同 |
+| `AdrInvalidTransition` | ADR 状态转换不在 `valid_transitions()` 白名单中 |
+
+**集成点**：`StateManager::new()` 时注册全部 5 个验证器；`apply_event()` 第一步调用 `registry.validate_all()`。
+
+---
+
+### 4.6 `search/` — SearchIndex + Inverted Index
+
+**职责**：将 ADR / Trap 的搜索从 `server.rs` 中的暴力遍历提取为独立模块，并引入倒排索引加速。
+
+| 文件 | 职责 |
+|---|---|
+| `search/scorer.rs` | `score_match_v3()`：精确词边界匹配 + 3-gram Jaccard 模糊匹配 + 短语 bonus |
+| `search/index.rs` | `SearchIndex::build()` + `search()`：倒排索引预过滤 + scorer 精排 |
+
+**倒排索引结构**：
+```
+terms: HashMap<String, Vec<(EntryType, usize)>>
+  "vue3"   → [(Adr, 0), (Adr, 3)]
+  "serde"  → [(Trap, 1)]
+```
+
+- **Build**：对所有 ADR（title/context/decision/tags）和 Trap（5 个字段）做 whitespace tokenization，建立 term → (type, idx) 映射
+- **Search**：tokenize query → 查 terms 取 candidate union → 对 candidate 调用 `score_match_v3` → 按分数排序
+- **Fallback**：若 query token 全未命中，回退到 brute-force（与旧行为一致）
+- **性能**：500 项 build < 200ms；常用 term 查询 < 50ms
+
+---
+
+### 4.7 `cli/cleanup.rs` — 手动清理 CLI
+
+**职责**：独立的同步运维工具，扫描 Memory 数据质量并执行手动迁移。不依赖 tokio，直接操作文件系统。
+
+**Pipeline**：`Scan → Analyze → Report → Confirm → Apply → Rebuild Cache`
+
+**检测的三类问题**：
+
+| 问题 | 处理方式 |
+|---|---|
+| Done tasks 仍在 `context.md` | 归档到 `tasks_archive.md`，按日期分组，全局 ID 去重 |
+| Stale ADRs（Superseded/Rejected/Archived）在 `decisions.md` | 迁移到 `decisions_archive.md` |
+| Duplicate ADRs（same title + same decision + different ID） | 保留高优先级版本，低优先级标记为 Superseded |
+
+**安全机制**：
+- `--dry-run`：只扫描报告，不修改任何文件
+- 自动备份：Apply 前创建 `.memguard/backups/YYYYMMDD-HHMMSS/`（含 manifest.json）
+- 交互确认：报告后提示 `Continue? (y/N)`，可 `--no-backup` 跳过备份
+- 幂等：第二次运行对同一数据输出 `No issues found`
+- Cache 重建：Apply 后立即重写 `runtime_state.json` + `search_index.json`
 
 ---
 
@@ -339,11 +444,16 @@ flush 任务（每个周期）:
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `src/main.rs` | ~109 | 入口点 + `resolve_project_root()` + `find_project_root()` |
-| `src/models.rs` | ~51 | 5 个领域结构体 + `RuntimeEvent` 枚举 |
-| `src/engine/state_manager.rs` | ~690 | 状态机、防抖 flush、generation counter、项目切换 |
-| `src/engine/projection.rs` | ~561 | Markdown ↔ Rust 双向转换 + 18 个单元测试 |
-| `src/mcp/server.rs` | ~700 | MCP JSON-RPC 2.0、工具路由、initialize 自动修正 |
+| `src/main.rs` | ~124 | 入口点 + `resolve_project_root()` + CLI 子命令路由 |
+| `src/models.rs` | ~200 | 领域结构体：`TaskStatus`/`AdrStatus` 枚举、`RuntimeEvent`、`Trap` 扩展 |
+| `src/cli/cleanup.rs` | ~695 | `memguard cleanup` 手动迁移工具（含 14 个集成测试） |
+| `src/engine/state_manager.rs` | ~1,050 | 状态机、防抖 flush、ADR 状态机、Validation Framework 集成 |
+| `src/engine/projection.rs` | ~1,118 | Markdown ↔ Rust 双向转换 + archive 分区 + 全局去重 |
+| `src/engine/validator.rs` | ~180 | `trait Validator` + `ValidationError` + `ValidatorRegistry` |
+| `src/engine/validators/*.rs` | ~5×150 | 5 个具体验证器 + 共享 `content_hash()` |
+| `src/search/scorer.rs` | ~180 | `score_match_v3` + `ngram_jaccard` + `contains_word` |
+| `src/search/index.rs` | ~580 | `SearchIndex` + 倒排索引 + `to_index_json()` |
+| `src/mcp/server.rs` | ~1,048 | MCP JSON-RPC 2.0、工具路由、initialize 自动修正 |
 | `build.ps1` | ~90 | 一键构建 + 安装配置指南 |
 | `QUICKREF.md` | ~40 | MCP 工具快速参考（非 Skill 文件） |
 | `blueprint.md` | ~154 | 原始架构蓝图（设计阶段产物） |

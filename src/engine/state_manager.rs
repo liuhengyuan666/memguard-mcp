@@ -1,7 +1,13 @@
 use crate::engine::projection;
+use crate::engine::validator::ValidatorRegistry;
+use crate::engine::validators::{
+    content_hash, AdrActiveConflict, AdrInvalidTransition, AdrRejectedRepeat, DuplicateTaskId,
+    EmptyTaskId,
+};
 use crate::models::*;
+use crate::search::index::SearchIndex;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,55 +33,68 @@ pub struct StateManager {
     context_ok: Arc<AtomicBool>,
     decisions_ok: Arc<AtomicBool>,
     traps_ok: Arc<AtomicBool>,
+    registry: ValidatorRegistry,
 }
 
-// ── ADR Conflict Detection ────────────────────────────────────────────────
-
-/// Compute a content hash for an ADR based on its title and decision fields.
-fn content_hash(adr: &ADR) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    adr.title.trim().to_lowercase().hash(&mut h);
-    adr.decision.trim().to_lowercase().hash(&mut h);
-    h.finish()
-}
-
-/// Structured error variants for ADR conflict detection.
+/// Structured error variants for state machine validation.
 #[derive(Debug)]
 pub enum AdrError {
-    ActiveConflict {
+    InvalidTransition {
         id: String,
-        existing_title: String,
-        new_title: String,
-    },
-    RejectedRepeat {
-        id: String,
+        current_status: AdrStatus,
+        valid_next: Vec<AdrStatus>,
     },
 }
 
 impl std::fmt::Display for AdrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AdrError::ActiveConflict {
+            AdrError::InvalidTransition {
                 id,
-                existing_title,
-                new_title,
-            } => write!(
-                f,
-                "[CONFLICT] ADR {} conflict: an active ADR with this id already exists with different content. Existing title: \"{}\", New title: \"{}\"",
-                id, existing_title, new_title
-            ),
-            AdrError::RejectedRepeat { id } => write!(
-                f,
-                "[CONFLICT] ADR {} was previously rejected with the same decision content. To re-submit, explain what material conditions have changed in the context field.",
-                id
-            ),
+                current_status,
+                valid_next,
+            } => {
+                let valid_strs: Vec<String> = valid_next
+                    .iter()
+                    .map(|s| format!("{}", s))
+                    .collect();
+                if valid_strs.is_empty() {
+                    write!(
+                        f,
+                        "[INVALID TRANSITION] ADR {} is in terminal state {} and cannot transition further.",
+                        id, current_status
+                    )
+                } else {
+                    write!(
+                        f,
+                        "[INVALID TRANSITION] ADR {} is {} but can only transition to: {}. Current transition not allowed.",
+                        id, current_status, valid_strs.join(", ")
+                    )
+                }
+            }
         }
     }
 }
 
 impl std::error::Error for AdrError {}
+
+/// Return the valid next states for a given ADR status.
+///
+/// Defines the ADR lifecycle state machine:
+///   Proposed → Accepted | Rejected
+///   Accepted → Superseded | Archived
+///   Rejected → Proposed (resubmission with material changes)
+///   Superseded → (terminal)
+///   Archived → (terminal)
+pub fn valid_transitions(status: &AdrStatus) -> Vec<AdrStatus> {
+    match status {
+        AdrStatus::Proposed => vec![AdrStatus::Accepted, AdrStatus::Rejected],
+        AdrStatus::Accepted => vec![AdrStatus::Superseded, AdrStatus::Archived],
+        AdrStatus::Rejected => vec![AdrStatus::Proposed],
+        AdrStatus::Superseded => vec![],
+        AdrStatus::Archived => vec![],
+    }
+}
 
 impl StateManager {
     /// Create a new StateManager, spawn the debounced flush background task.
@@ -83,6 +102,7 @@ impl StateManager {
         let state = Arc::new(RwLock::new(RuntimeState {
             current_phase: String::new(),
             active_tasks: Vec::new(),
+            done_tasks: Vec::new(),
             constraints: Vec::new(),
         }));
         let decisions = Arc::new(RwLock::new(Vec::new()));
@@ -154,6 +174,13 @@ impl StateManager {
             }
         });
 
+        let mut registry = ValidatorRegistry::new();
+        registry.register(Box::new(EmptyTaskId));
+        registry.register(Box::new(DuplicateTaskId));
+        registry.register(Box::new(AdrActiveConflict));
+        registry.register(Box::new(AdrRejectedRepeat));
+        registry.register(Box::new(AdrInvalidTransition));
+
         Self {
             state,
             decisions,
@@ -164,6 +191,7 @@ impl StateManager {
             context_ok,
             decisions_ok,
             traps_ok,
+            registry,
         }
     }
 
@@ -314,38 +342,54 @@ impl StateManager {
     /// and dropped BEFORE the flush signal is sent.  This prevents deadlocks
     /// and ensures the lock is never held across an `.await` point.
     pub async fn apply_event(&self, event: RuntimeEvent) -> Result<()> {
+        // Pre-validation: run all registered validators before acquiring any locks.
+        // Validators are pure (no side-effects) and short-circuit on first error.
+        {
+            let state = self.state.read().await;
+            let decisions = self.decisions.read().await;
+            let traps = self.traps.read().await;
+            if let Err(e) = self.registry.validate_all(&event, &state, &decisions, &traps) {
+                // Use only the message field to preserve exact error format from
+                // the previous inline checks (ADR tests check for "[CONFLICT]" prefix).
+                return Err(anyhow::anyhow!("{}", e.message));
+            }
+        }
+        // Read-locks dropped; all validators passed.
+
         match event {
             RuntimeEvent::TaskUpdated {
                 task_id,
                 new_status,
             } => {
                 let mut state = self.state.write().await;
-                let task = state
-                    .active_tasks
-                    .iter_mut()
-                    .find(|t| t.id == task_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Task not found: {}", task_id)
-                    })?;
-                task.status = new_status;
+                if new_status == TaskStatus::Done {
+                    // Move Done task from active_tasks to done_tasks for archival.
+                    let idx = state
+                        .active_tasks
+                        .iter()
+                        .position(|t| t.id == task_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Task not found: {}", task_id)
+                        })?;
+                    let mut task = state.active_tasks.remove(idx);
+                    task.status = TaskStatus::Done;
+                    state.done_tasks.push(task);
+                } else {
+                    let task = state
+                        .active_tasks
+                        .iter_mut()
+                        .find(|t| t.id == task_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Task not found: {}", task_id)
+                        })?;
+                    task.status = new_status;
+                }
                 // Lock dropped here (end of scope).
             }
 
             RuntimeEvent::TaskCreated(task) => {
                 let mut state = self.state.write().await;
-                // Reject empty task IDs.
-                if task.id.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "Task ID cannot be empty."
-                    ));
-                }
-                // Reject duplicate task IDs.
-                if state.active_tasks.iter().any(|t| t.id == task.id) {
-                    return Err(anyhow::anyhow!(
-                        "Task with id '{}' already exists. Use TaskUpdated to modify it.",
-                        task.id
-                    ));
-                }
+                // Validation (empty ID, duplicate ID) handled by pre-validation above.
                 // Always start as Todo regardless of caller input.
                 let mut task = task;
                 task.status = TaskStatus::Todo;
@@ -357,50 +401,39 @@ impl StateManager {
                 let mut decisions = self.decisions.write().await;
                 let new_hash = content_hash(&adr);
 
-                // Check ALL existing ADRs with the same ID for conflict.
-                // A single Vec may contain multiple entries for the same ID
-                // (e.g., after bootstrap loads both decisions.md and archive).
-                let mut active_adr: Option<&ADR> = None;
-                let mut rejected_adr: Option<&ADR> = None;
+                // Idempotent: if same content already exists as active, silently ignore.
+                // ActiveConflict (different content on active) and RejectedRepeat
+                // (same content as rejected) are caught by validators above.
+                if let Some(active) = decisions
+                    .iter()
+                    .find(|a| a.id == adr.id && a.status == AdrStatus::Accepted)
+                    && content_hash(active) == new_hash
+                {
+                    drop(decisions);
+                    let _ = self.flush_tx.send(());
+                    return Ok(());
+                }
+
+                // Validate state transitions: if any existing ADR with this ID
+                // is in a terminal state (no valid next states), reject.
                 for existing in decisions.iter().filter(|a| a.id == adr.id) {
-                    if existing.status == "active" && active_adr.is_none() {
-                        active_adr = Some(existing);
+                    let valid_next = valid_transitions(&existing.status);
+                    if valid_next.is_empty() {
+                        return Err(AdrError::InvalidTransition {
+                            id: adr.id.clone(),
+                            current_status: existing.status.clone(),
+                            valid_next,
+                        }
+                        .into());
                     }
-                    if existing.status == "rejected" && rejected_adr.is_none() {
-                        rejected_adr = Some(existing);
-                    }
-                }
-
-                if let Some(active) = active_adr {
-                    let active_hash = content_hash(active);
-                    if new_hash == active_hash {
-                        // Idempotent: same content, silently ignore.
-                        drop(decisions);
-                        let _ = self.flush_tx.send(());
-                        return Ok(());
-                    }
-                    return Err(AdrError::ActiveConflict {
-                        id: adr.id,
-                        existing_title: active.title.clone(),
-                        new_title: adr.title,
-                    }
-                    .into());
-                }
-
-                if let Some(rejected) = rejected_adr {
-                    let rejected_hash = content_hash(rejected);
-                    if new_hash == rejected_hash {
-                        return Err(AdrError::RejectedRepeat { id: adr.id }.into());
-                    }
-                    // Different content: fall through to supersede + push.
                 }
 
                 // No conflict: mark all existing versions as superseded, then push new.
                 for existing in decisions.iter_mut().filter(|a| a.id == adr.id) {
-                    existing.status = "superseded".to_string();
+                    existing.status = AdrStatus::Superseded;
                 }
                 let mut adr = adr;
-                adr.status = "active".to_string();
+                adr.status = AdrStatus::Accepted;
                 decisions.push(adr);
                 self.decisions_ok.store(true, Ordering::Release);
             }
@@ -457,38 +490,14 @@ impl StateManager {
                 .context("Failed to write .memguard/runtime_state.json")?;
         }
 
-        // search_index.json
+        // search_index.json — inverted-index format
         {
             let decisions = self.decisions.read().await;
             let traps = self.traps.read().await;
 
-            let adr_entries: Vec<serde_json::Value> = decisions
-                .iter()
-                .map(|a| {
-                    serde_json::json!({
-                        "id": a.id,
-                        "title": a.title,
-                        "status": a.status,
-                        "tags": a.tags,
-                    })
-                })
-                .collect();
-
-            let trap_entries: Vec<serde_json::Value> = traps
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "signature": t.error_signature,
-                        "solution": t.solution,
-                    })
-                })
-                .collect();
-
-            let index = serde_json::json!({
-                "adrs": adr_entries,
-                "traps": trap_entries,
-            });
-            let json = serde_json::to_string_pretty(&index)
+            let search_index = SearchIndex::build(&decisions, &traps);
+            let index_json = search_index.to_index_json(&decisions, &traps);
+            let json = serde_json::to_string_pretty(&index_json)
                 .context("Failed to serialize search_index")?;
             tokio::fs::write(memguard_dir.join("search_index.json"), json)
                 .await
@@ -524,7 +533,7 @@ struct LoadedFiles {
 /// filesystem issues from triggering the greenfield path which would
 /// overwrite existing files with empty content.
 async fn load_state_from_disk(
-    root: &PathBuf,
+    root: &Path,
 ) -> Result<LoadedFiles> {
     let memory_dir = root.join("memory");
 
@@ -537,6 +546,7 @@ async fn load_state_from_disk(
             state: RuntimeState {
                 current_phase: String::new(),
                 active_tasks: Vec::new(),
+                done_tasks: Vec::new(),
                 constraints: Vec::new(),
             },
             decisions: Vec::new(),
@@ -550,7 +560,6 @@ async fn load_state_from_disk(
 
     let mut context_parsed = false;
     let mut traps_parsed = false;
-    let decisions_parsed;
 
     // ── Load context.md ─────────────────────────────────────────
     let state = {
@@ -581,6 +590,7 @@ async fn load_state_from_disk(
                     RuntimeState {
                         current_phase: String::new(),
                         active_tasks: Vec::new(),
+                        done_tasks: Vec::new(),
                         constraints: Vec::new(),
                     }
                 }
@@ -589,6 +599,7 @@ async fn load_state_from_disk(
             RuntimeState {
                 current_phase: String::new(),
                 active_tasks: Vec::new(),
+                done_tasks: Vec::new(),
                 constraints: Vec::new(),
             }
         }
@@ -652,14 +663,13 @@ async fn load_state_from_disk(
     // Deduplicate by ID: keep the entry with the highest-priority status.
     // This prevents duplicate ADR entries when bootstrap loads both
     // decisions.md (active) and decisions_archive.md (superseded).
-    fn adr_status_priority(s: &str) -> u8 {
+    fn adr_status_priority(s: &AdrStatus) -> u8 {
         match s {
-            "active" => 5,
-            "proposed" => 4,
-            "rejected" => 3,
-            "superseded" => 2,
-            "deprecated" => 1,
-            _ => 0,
+            AdrStatus::Accepted => 5,
+            AdrStatus::Proposed => 4,
+            AdrStatus::Rejected => 3,
+            AdrStatus::Superseded => 2,
+            AdrStatus::Archived => 1,
         }
     }
     let mut best_by_id: std::collections::HashMap<String, ADR> = std::collections::HashMap::new();
@@ -683,7 +693,7 @@ async fn load_state_from_disk(
     });
     decisions = deduped;
 
-    decisions_parsed = main_parsed || archive_parsed;
+    let decisions_parsed = main_parsed || archive_parsed;
 
     // ── Load traps.md ───────────────────────────────────────────
     let traps = {
@@ -733,7 +743,7 @@ async fn flush_inner(
     state: &Arc<RwLock<RuntimeState>>,
     decisions: &Arc<RwLock<Vec<ADR>>>,
     traps: &Arc<RwLock<Vec<Trap>>>,
-    project_root: &PathBuf,
+    project_root: &Path,
     context_ok: &AtomicBool,
     decisions_ok: &AtomicBool,
     traps_ok: &AtomicBool,
@@ -775,7 +785,7 @@ async fn flush_inner(
     {
         let d = decisions.read().await;
         let (active_adrs, stale_adrs): (Vec<ADR>, Vec<ADR>) =
-            d.iter().cloned().partition(|adr| adr.status == "active");
+            d.iter().cloned().partition(|adr| matches!(adr.status, AdrStatus::Accepted | AdrStatus::Proposed));
 
         let mut active_rendered = String::new();
         if !stale_adrs.is_empty() {
@@ -818,6 +828,60 @@ async fn flush_inner(
         }
     }
 
+    // tasks_archive.md — append newly Done tasks, grouped by date.
+    {
+        let mut s = state.write().await;
+        if !s.done_tasks.is_empty() {
+            // Compute today's date in YYYY-MM-DD format.
+            let today = {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                // Days since UNIX epoch.
+                let days = secs / 86400;
+                // Howard Hinnant civil date algorithm (tm_years from 0000-03-01).
+                let z = days as i64 + 719468;
+                let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+                let doe = (z - era * 146097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = if m <= 2 { y + 1 } else { y };
+                format!("{:04}-{:02}-{:02}", y, m, d)
+            };
+
+            let archive_path = memory_dir.join("tasks_archive.md");
+            let existing = if tokio::fs::try_exists(&archive_path)
+                .await
+                .unwrap_or(false)
+            {
+                tokio::fs::read_to_string(&archive_path)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let appended = projection::append_tasks_archive(
+                &existing,
+                &s.done_tasks,
+                &today,
+            );
+
+            if let Err(e) = tokio::fs::write(&archive_path, &appended).await {
+                errors.push(format!("memory/tasks_archive.md: {}", e));
+            }
+
+            // Clear done_tasks so they are not archived again.
+            s.done_tasks.clear();
+        }
+    }
+
     // ── Write .memguard/ cache files ────────────────────────────────
 
     // runtime_state.json
@@ -840,37 +904,15 @@ async fn flush_inner(
         }
     }
 
-    // search_index.json
+    // search_index.json — inverted-index format
     {
         let d = decisions.read().await;
         let t = traps.read().await;
 
-        let adr_entries: Vec<serde_json::Value> = d
-            .iter()
-            .map(|a| {
-                serde_json::json!({
-                    "id": a.id,
-                    "title": a.title,
-                    "status": a.status,
-                    "tags": a.tags,
-                })
-            })
-            .collect();
+        let search_index = SearchIndex::build(&d, &t);
+        let index_json = search_index.to_index_json(&d, &t);
 
-        let trap_entries: Vec<serde_json::Value> = t
-            .iter()
-            .map(|tr| {
-                serde_json::json!({
-                    "signature": tr.error_signature,
-                    "solution": tr.solution,
-                })
-            })
-            .collect();
-
-        match serde_json::to_string_pretty(&serde_json::json!({
-            "adrs": adr_entries,
-            "traps": trap_entries,
-        })) {
+        match serde_json::to_string_pretty(&index_json) {
             Ok(json) => {
                 if let Err(e) = tokio::fs::write(
                     memguard_dir.join("search_index.json"),
@@ -959,8 +1001,10 @@ mod tests {
         .expect("apply should succeed");
 
         let state = mgr.state.read().await;
+        assert!(state.active_tasks.is_empty());
+        assert_eq!(state.done_tasks.len(), 1);
         assert!(matches!(
-            state.active_tasks[0].status,
+            state.done_tasks[0].status,
             TaskStatus::Done
         ));
     }
@@ -987,7 +1031,7 @@ mod tests {
         let adr = ADR {
             id: "ADR-001".into(),
             title: "Test ADR".into(),
-            status: "Proposed".into(),
+            status: AdrStatus::Proposed,
             context: "Test context".into(),
             decision: "Test decision".into(),
             tags: vec!["test".into()],
@@ -1000,7 +1044,7 @@ mod tests {
         let decisions = mgr.decisions.read().await;
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].id, "ADR-001");
-        assert_eq!(decisions[0].status, "active"); // forced to active
+        assert_eq!(decisions[0].status, AdrStatus::Accepted); // forced to active
     }
 
     #[tokio::test]
@@ -1011,7 +1055,7 @@ mod tests {
         let adr1 = ADR {
             id: "ADR-001".into(),
             title: "First".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "".into(),
             tags: vec![],
@@ -1024,7 +1068,7 @@ mod tests {
         let adr2 = ADR {
             id: "ADR-001".into(),
             title: "Second".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "".into(),
             tags: vec![],
@@ -1062,6 +1106,8 @@ mod tests {
             error_signature: "NPE".into(),
             context: "Null pointer".into(),
             solution: "Add check".into(),
+            root_cause: String::new(),
+            prevention: String::new(),
         };
 
         mgr.apply_event(RuntimeEvent::TrapRecorded(trap))
@@ -1112,7 +1158,7 @@ mod tests {
         let adr1 = ADR {
             id: "ADR-001".into(),
             title: "Use Postgres".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use Postgres for persistence".into(),
             tags: vec![],
@@ -1124,7 +1170,7 @@ mod tests {
         let adr2 = ADR {
             id: "ADR-001".into(),
             title: "Use SQLite".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use SQLite for persistence".into(),
             tags: vec![],
@@ -1144,7 +1190,7 @@ mod tests {
         let adr1 = ADR {
             id: "ADR-001".into(),
             title: "Use Postgres".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use Postgres for persistence".into(),
             tags: vec![],
@@ -1156,7 +1202,7 @@ mod tests {
         let adr2 = ADR {
             id: "ADR-001".into(),
             title: "Use Postgres".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use Postgres for persistence".into(),
             tags: vec![],
@@ -1167,7 +1213,7 @@ mod tests {
 
         let decisions = mgr.decisions.read().await;
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].status, "active");
+        assert_eq!(decisions[0].status, AdrStatus::Accepted);
     }
 
     #[tokio::test]
@@ -1180,7 +1226,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Use Cassandra".into(),
-                status: "rejected".into(),
+                status: AdrStatus::Rejected,
                 context: "".into(),
                 decision: "Use Cassandra for persistence".into(),
                 tags: vec![],
@@ -1190,7 +1236,7 @@ mod tests {
         let adr = ADR {
             id: "ADR-001".into(),
             title: "Use Cassandra".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use Cassandra for persistence".into(),
             tags: vec![],
@@ -1212,7 +1258,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Use Cassandra".into(),
-                status: "rejected".into(),
+                status: AdrStatus::Rejected,
                 context: "".into(),
                 decision: "Use Cassandra for persistence".into(),
                 tags: vec![],
@@ -1222,7 +1268,7 @@ mod tests {
         let adr = ADR {
             id: "ADR-001".into(),
             title: "Use Cassandra with Sharding".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "New scaling requirements".into(),
             decision: "Use Cassandra with consistent hashing".into(),
             tags: vec![],
@@ -1233,13 +1279,13 @@ mod tests {
 
         let decisions = mgr.decisions.read().await;
         assert_eq!(decisions.len(), 2);
-        assert_eq!(decisions[0].status, "superseded");
-        assert_eq!(decisions[1].status, "active");
+        assert_eq!(decisions[0].status, AdrStatus::Superseded);
+        assert_eq!(decisions[1].status, AdrStatus::Accepted);
         assert_eq!(decisions[1].title, "Use Cassandra with Sharding");
     }
 
     #[tokio::test]
-    async fn test_adr_superseded_allowed() {
+    async fn test_adr_superseded_is_terminal() {
         let (_dir, mgr) = setup_temp_dir();
         mgr.bootstrap().await.unwrap();
 
@@ -1248,7 +1294,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Use MySQL".into(),
-                status: "superseded".into(),
+                status: AdrStatus::Superseded,
                 context: "".into(),
                 decision: "Use MySQL for persistence".into(),
                 tags: vec![],
@@ -1258,20 +1304,29 @@ mod tests {
         let adr = ADR {
             id: "ADR-001".into(),
             title: "Use Postgres".into(),
-            status: "".into(),
+            status: AdrStatus::Proposed,
             context: "".into(),
             decision: "Use Postgres for persistence".into(),
             tags: vec![],
         };
-        mgr.apply_event(RuntimeEvent::AdrCommitted(adr))
-            .await
-            .unwrap();
-
-        let decisions = mgr.decisions.read().await;
-        assert_eq!(decisions.len(), 2);
-        assert_eq!(decisions[0].status, "superseded");
-        assert_eq!(decisions[1].status, "active");
-        assert_eq!(decisions[1].title, "Use Postgres");
+        let result = mgr.apply_event(RuntimeEvent::AdrCommitted(adr)).await;
+        assert!(result.is_err(), "Superseded ADR should reject further transitions");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("INVALID TRANSITION"),
+            "should be InvalidTransition, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("terminal"),
+            "should mention terminal state, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("ADR-001"),
+            "should mention ADR id, got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -1284,7 +1339,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Active Choice".into(),
-                status: "active".into(),
+                status: AdrStatus::Accepted,
                 context: "ctx".into(),
                 decision: "dec".into(),
                 tags: vec!["a".into()],
@@ -1292,7 +1347,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-002".into(),
                 title: "Superseded Choice".into(),
-                status: "superseded".into(),
+                status: AdrStatus::Superseded,
                 context: "ctx2".into(),
                 decision: "dec2".into(),
                 tags: vec![],
@@ -1300,7 +1355,7 @@ mod tests {
             decisions.push(ADR {
                 id: "ADR-003".into(),
                 title: "Rejected Choice".into(),
-                status: "rejected".into(),
+                status: AdrStatus::Rejected,
                 context: "ctx3".into(),
                 decision: "dec3".into(),
                 tags: vec![],
@@ -1431,7 +1486,7 @@ old dec
         let decisions = mgr.decisions.read().await;
         // Should deduplicate ADR-001 to a single entry (active has priority)
         assert_eq!(decisions.len(), 1, "ADR-001 should be deduplicated");
-        assert_eq!(decisions[0].status, "active", "higher-priority status should win");
+        assert_eq!(decisions[0].status, AdrStatus::Accepted, "higher-priority status should win");
     }
 
     #[tokio::test]
@@ -1444,7 +1499,7 @@ old dec
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Only Active".into(),
-                status: "active".into(),
+                status: AdrStatus::Accepted,
                 context: "ctx".into(),
                 decision: "dec".into(),
                 tags: vec![],
@@ -1472,7 +1527,7 @@ old dec
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Old".into(),
-                status: "superseded".into(),
+                status: AdrStatus::Superseded,
                 context: "old".into(),
                 decision: "old".into(),
                 tags: vec![],
@@ -1480,7 +1535,7 @@ old dec
             decisions.push(ADR {
                 id: "ADR-001".into(),
                 title: "Current".into(),
-                status: "active".into(),
+                status: AdrStatus::Accepted,
                 context: "ctx".into(),
                 decision: "dec".into(),
                 tags: vec![],
@@ -1491,7 +1546,7 @@ old dec
         let event = RuntimeEvent::AdrCommitted(ADR {
             id: "ADR-001".into(),
             title: "New".into(),
-            status: "active".into(),
+            status: AdrStatus::Accepted,
             context: "new ctx".into(),
             decision: "new dec".into(),
             tags: vec![],
@@ -1568,5 +1623,231 @@ old dec
         assert!(result.is_err(), "should reject duplicate task ID");
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("already exists"), "error should mention conflict: {}", err_msg);
+    }
+
+    // ── ADR State Machine Transition Tests ──────────────────────────────
+
+    #[test]
+    fn test_adr_proposed_to_accepted() {
+        let transitions = valid_transitions(&AdrStatus::Proposed);
+        assert!(transitions.contains(&AdrStatus::Accepted));
+        assert!(transitions.contains(&AdrStatus::Rejected));
+        assert_eq!(transitions.len(), 2);
+    }
+
+    #[test]
+    fn test_adr_accepted_to_superseded() {
+        let transitions = valid_transitions(&AdrStatus::Accepted);
+        assert!(transitions.contains(&AdrStatus::Superseded));
+    }
+
+    #[test]
+    fn test_adr_accepted_to_archived() {
+        let transitions = valid_transitions(&AdrStatus::Accepted);
+        assert!(transitions.contains(&AdrStatus::Archived));
+        assert_eq!(transitions.len(), 2);
+    }
+
+    #[test]
+    fn test_adr_rejected_to_proposed() {
+        let transitions = valid_transitions(&AdrStatus::Rejected);
+        assert!(transitions.contains(&AdrStatus::Proposed));
+        assert_eq!(transitions.len(), 1);
+    }
+
+    #[test]
+    fn test_valid_transitions_superseded_terminal() {
+        let transitions = valid_transitions(&AdrStatus::Superseded);
+        assert!(
+            transitions.is_empty(),
+            "Superseded should have no valid next states"
+        );
+    }
+
+    #[test]
+    fn test_valid_transitions_archived_terminal() {
+        let transitions = valid_transitions(&AdrStatus::Archived);
+        assert!(
+            transitions.is_empty(),
+            "Archived should have no valid next states"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adr_archived_is_terminal_handler() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        {
+            let mut decisions = mgr.decisions.write().await;
+            decisions.push(ADR {
+                id: "ADR-001".into(),
+                title: "Archived Choice".into(),
+                status: AdrStatus::Archived,
+                context: "".into(),
+                decision: "Archived decision".into(),
+                tags: vec![],
+            });
+        }
+
+        let adr = ADR {
+            id: "ADR-001".into(),
+            title: "New Choice".into(),
+            status: AdrStatus::Proposed,
+            context: "".into(),
+            decision: "New decision".into(),
+            tags: vec![],
+        };
+        let result = mgr.apply_event(RuntimeEvent::AdrCommitted(adr)).await;
+        assert!(result.is_err(), "Archived ADR should reject further transitions");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("INVALID TRANSITION"),
+            "should be InvalidTransition, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("terminal"),
+            "should mention terminal state, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("ADR-001"),
+            "should mention ADR id, got: {}",
+            err_msg
+        );
+    }
+
+    // ── Done-task auto-archive tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_done_task_auto_archived() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        // Create two tasks and mark them Done.
+        for (id, desc) in &[("TASK-001", "First task"), ("TASK-002", "Second task")] {
+            mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+                id: id.to_string(),
+                description: desc.to_string(),
+                status: TaskStatus::Todo,
+            }))
+            .await
+            .unwrap();
+        }
+
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-001".into(),
+            new_status: TaskStatus::Done,
+        })
+        .await
+        .unwrap();
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-002".into(),
+            new_status: TaskStatus::Done,
+        })
+        .await
+        .unwrap();
+
+        // Verify removed from active, placed in done.
+        {
+            let state = mgr.state.read().await;
+            assert!(state.active_tasks.is_empty());
+            assert_eq!(state.done_tasks.len(), 2);
+        }
+
+        // Flush and verify tasks_archive.md was created.
+        mgr.flush_now().await.expect("flush should succeed");
+
+        let project_root = mgr.project_root.read().await.clone();
+        let archive_path = project_root.join("memory/tasks_archive.md");
+        assert!(archive_path.exists(), "tasks_archive.md should be created");
+
+        let content = tokio::fs::read_to_string(&archive_path)
+            .await
+            .unwrap();
+        assert!(content.contains("TASK-001"), "should contain TASK-001: {}", content);
+        assert!(content.contains("First task"), "should contain desc: {}", content);
+        assert!(content.contains("TASK-002"), "should contain TASK-002: {}", content);
+        assert!(content.contains("Second task"), "should contain desc: {}", content);
+        assert!(content.contains("# Archived Tasks"), "should have header");
+        assert!(content.contains("[Done]"), "should have Done status marker");
+
+        // done_tasks should be cleared after flush.
+        {
+            let state = mgr.state.read().await;
+            assert!(state.done_tasks.is_empty(), "done_tasks should be cleared");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_done_marking() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        // Create a task.
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-000".into(),
+            description: "Only task".into(),
+            status: TaskStatus::Todo,
+        }))
+        .await
+        .unwrap();
+
+        // Mark Done — first time.
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-000".into(),
+            new_status: TaskStatus::Done,
+        })
+        .await
+        .unwrap();
+
+        // Flush once.
+        mgr.flush_now().await.unwrap();
+
+        // Second Done-marking should fail (task no longer in active_tasks).
+        let result = mgr
+            .apply_event(RuntimeEvent::TaskUpdated {
+                task_id: "TASK-000".into(),
+                new_status: TaskStatus::Done,
+            })
+            .await;
+        assert!(result.is_err(), "second Done should fail — task not in active");
+
+        // Verify no duplicate in done_tasks.
+        {
+            let state = mgr.state.read().await;
+            assert_eq!(state.done_tasks.len(), 0, "done_tasks should be empty after flush");
+        }
+
+        // Flush again — archive should NOT have duplicate entry.
+        mgr.flush_now().await.unwrap();
+
+        let project_root = mgr.project_root.read().await.clone();
+        let content = tokio::fs::read_to_string(
+            project_root.join("memory/tasks_archive.md"),
+        )
+        .await
+        .unwrap();
+
+        // Count occurrences of TASK-000 in the archive.
+        let count = content.matches("TASK-000").count();
+        assert_eq!(count, 1, "TASK-000 should appear exactly once in archive, got {} in:\n{}", count, content);
+    }
+
+    #[tokio::test]
+    async fn test_greenfield_no_archive() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        // Greenfield — no tasks created. Flush should NOT create tasks_archive.md.
+        mgr.flush_now().await.expect("flush should succeed");
+
+        let project_root = mgr.project_root.read().await.clone();
+        let archive_path = project_root.join("memory/tasks_archive.md");
+        assert!(
+            !archive_path.exists(),
+            "tasks_archive.md should not be created when no Done tasks exist"
+        );
     }
 }

@@ -1,6 +1,7 @@
 use crate::models::*;
 use anyhow::{anyhow, Result};
 use regex::Regex;
+use std::collections::HashSet;
 
 // ── context.md ↔ RuntimeState ──────────────────────────────────────────────
 
@@ -83,6 +84,7 @@ pub fn parse_context(md: &str) -> Result<RuntimeState> {
     Ok(RuntimeState {
         current_phase,
         active_tasks: tasks,
+        done_tasks: Vec::new(),
         constraints,
     })
 }
@@ -115,10 +117,14 @@ pub fn render_context(state: &RuntimeState) -> String {
         md.push('\n');
     } else {
         for task in &state.active_tasks {
+            if matches!(task.status, TaskStatus::Done) {
+                continue;
+            }
             let status = match task.status {
                 TaskStatus::Todo => "Todo",
                 TaskStatus::InProgress => "InProgress",
                 TaskStatus::Done => "Done",
+                TaskStatus::Blocked => "Blocked",
             };
             md.push_str(&format!("- [{}] [{}] {}\n", status, task.id, task.description));
         }
@@ -136,6 +142,85 @@ pub fn render_context(state: &RuntimeState) -> String {
     }
 
     md
+}
+
+/// Scan the entire markdown for already-archived task IDs.
+///
+/// Parses lines matching `- [Done] [<id>]` and collects the IDs into a
+/// HashSet so callers can globally deduplicate across all date sections.
+fn extract_task_ids(md: &str) -> HashSet<String> {
+    let re = Regex::new(r"^-\s*\[Done\]\s*\[([A-Za-z0-9_-]+)\]").unwrap();
+    md.lines()
+        .filter_map(|line| re.captures(line).map(|cap| cap[1].to_string()))
+        .collect()
+}
+
+/// Append newly Done tasks to an existing tasks_archive.md content.
+///
+/// Groups entries by date.  If `existing` already contains today's section,
+/// new entries are appended within it; otherwise a new date heading is created.
+///
+/// Tasks whose IDs already appear ANYWHERE in the existing archive are
+/// silently skipped (globally deduplicated, keeping the earliest date).
+pub fn append_tasks_archive(
+    existing: &str,
+    new_tasks: &[Task],
+    today_date: &str,
+) -> String {
+    let existing_ids = extract_task_ids(existing);
+
+    let tasks_to_add: Vec<&Task> = new_tasks
+        .iter()
+        .filter(|t| !existing_ids.contains(&t.id))
+        .collect();
+
+    if tasks_to_add.is_empty() {
+        return existing.to_string();
+    }
+
+    let title = "# Archived Tasks\n\n";
+
+    if existing.is_empty() {
+        let mut out = title.to_string();
+        out.push_str(&format!("## {}\n", today_date));
+        for t in tasks_to_add {
+            out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
+        }
+        out.push('\n');
+        return out;
+    }
+
+    // Check if today's date already has a section heading.
+    let today_header = format!("## {}", today_date);
+    if let Some(pos) = existing.find(&today_header) {
+        // Find the end of this section (next `## ` header or EOF).
+        let after_header = &existing[pos..];
+        let next_section = after_header[today_header.len()..]
+            .find("\n## ");
+        let section_end = next_section
+            .map(|i| pos + today_header.len() + i)
+            .unwrap_or(existing.len());
+        let mut out = existing[..section_end].to_string();
+        for t in &tasks_to_add {
+            out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
+        }
+        // Append trailing content after this section.
+        if section_end < existing.len() {
+            out.push_str(&existing[section_end..]);
+        } else {
+            out.push('\n');
+        }
+        return out;
+    }
+
+    // No today section — append new section at the end.
+    let mut out = existing.trim_end().to_string();
+    out.push_str(&format!("\n\n## {}\n", today_date));
+    for t in &tasks_to_add {
+        out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
+    }
+    out.push('\n');
+    out
 }
 
 // ── decisions.md ↔ Vec<ADR> ────────────────────────────────────────────────
@@ -184,7 +269,7 @@ pub fn parse_decisions(md: &str) -> Result<Vec<ADR>> {
                 adrs.push(ADR {
                     id: std::mem::take(&mut id),
                     title: std::mem::take(&mut title),
-                    status: std::mem::take(&mut status),
+                    status: status.parse().unwrap_or(AdrStatus::Proposed),
                     context: std::mem::take(&mut context).trim().to_string(),
                     decision: std::mem::take(&mut decision).trim().to_string(),
                     tags: std::mem::take(&mut tags),
@@ -260,7 +345,7 @@ pub fn parse_decisions(md: &str) -> Result<Vec<ADR>> {
         adrs.push(ADR {
             id,
             title,
-            status,
+            status: status.parse().unwrap_or(AdrStatus::Proposed),
             context: context.trim().to_string(),
             decision: decision.trim().to_string(),
             tags,
@@ -300,6 +385,41 @@ pub fn render_decisions(adrs: &[ADR]) -> String {
         .join("\n")
 }
 
+/// Render active ADRs (Accepted, Proposed) to Markdown, with a header
+/// linking to the archive when stale decisions exist.
+#[allow(dead_code)]
+pub fn render_active_decisions(adrs: &[ADR]) -> String {
+    let active: Vec<_> = adrs
+        .iter()
+        .filter(|a| matches!(a.status, AdrStatus::Accepted | AdrStatus::Proposed))
+        .cloned()
+        .collect();
+    if active.is_empty() {
+        return String::new();
+    }
+    let stale_count = adrs
+        .iter()
+        .filter(|a| !matches!(a.status, AdrStatus::Accepted | AdrStatus::Proposed))
+        .count();
+    let mut md = String::new();
+    if stale_count > 0 {
+        md.push_str("> Historical decisions are in [decisions_archive.md](./decisions_archive.md)\n\n");
+    }
+    md.push_str(&render_decisions(&active));
+    md
+}
+
+/// Render stale ADRs (Superseded, Rejected, Archived) to Markdown.
+#[allow(dead_code)]
+pub fn render_stale_decisions(adrs: &[ADR]) -> String {
+    let stale: Vec<_> = adrs
+        .iter()
+        .filter(|a| !matches!(a.status, AdrStatus::Accepted | AdrStatus::Proposed))
+        .cloned()
+        .collect();
+    render_decisions(&stale)
+}
+
 // ── traps.md ↔ Vec<Trap> ───────────────────────────────────────────────────
 
 /// Parse traps.md content into a vector of Traps.
@@ -325,7 +445,9 @@ pub fn parse_traps(md: &str) -> Result<Vec<Trap>> {
     let mut section: &str = "none";
     let mut error_signature = String::new();
     let mut context = String::new();
+    let mut root_cause = String::new();
     let mut solution = String::new();
+    let mut prevention = String::new();
 
     for line in md.lines() {
         let line = line.trim();
@@ -336,14 +458,18 @@ pub fn parse_traps(md: &str) -> Result<Vec<Trap>> {
                 traps.push(Trap {
                     error_signature: std::mem::take(&mut error_signature),
                     context: std::mem::take(&mut context).trim().to_string(),
+                    root_cause: std::mem::take(&mut root_cause).trim().to_string(),
                     solution: std::mem::take(&mut solution).trim().to_string(),
+                    prevention: std::mem::take(&mut prevention).trim().to_string(),
                 });
             }
 
             in_trap = true;
             section = "none";
             context.clear();
+            root_cause.clear();
             solution.clear();
+            prevention.clear();
             error_signature = rest.trim().to_string();
             continue;
         }
@@ -356,8 +482,16 @@ pub fn parse_traps(md: &str) -> Result<Vec<Trap>> {
             section = "context";
             continue;
         }
+        if line == "### Root Cause" {
+            section = "root_cause";
+            continue;
+        }
         if line == "### Solution" {
             section = "solution";
+            continue;
+        }
+        if line == "### Prevention" {
+            section = "prevention";
             continue;
         }
 
@@ -366,9 +500,17 @@ pub fn parse_traps(md: &str) -> Result<Vec<Trap>> {
                 context.push_str(line);
                 context.push('\n');
             }
+            "root_cause" => {
+                root_cause.push_str(line);
+                root_cause.push('\n');
+            }
             "solution" => {
                 solution.push_str(line);
                 solution.push('\n');
+            }
+            "prevention" => {
+                prevention.push_str(line);
+                prevention.push('\n');
             }
             _ => {}
         }
@@ -378,7 +520,9 @@ pub fn parse_traps(md: &str) -> Result<Vec<Trap>> {
         traps.push(Trap {
             error_signature,
             context: context.trim().to_string(),
+            root_cause: root_cause.trim().to_string(),
             solution: solution.trim().to_string(),
+            prevention: prevention.trim().to_string(),
         });
     }
 
@@ -392,9 +536,23 @@ pub fn render_trap(trap: &Trap) -> String {
     md.push_str(&format!("## Trap: {}\n\n", trap.error_signature));
     md.push_str("### Context\n");
     md.push_str(&trap.context);
-    md.push_str("\n\n### Solution\n");
+    md.push('\n');
+
+    if !trap.root_cause.is_empty() {
+        md.push_str("\n### Root Cause\n");
+        md.push_str(&trap.root_cause);
+        md.push('\n');
+    }
+
+    md.push_str("\n### Solution\n");
     md.push_str(&trap.solution);
     md.push('\n');
+
+    if !trap.prevention.is_empty() {
+        md.push_str("\n### Prevention\n");
+        md.push_str(&trap.prevention);
+        md.push('\n');
+    }
 
     md
 }
@@ -484,7 +642,7 @@ fn extract_section_body(rest: &str) -> String {
 /// sequentially.  Legacy formats without explicit status default to `Todo`.
 fn parse_task_lines(rest: &str) -> Vec<Task> {
     static TASK_LINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"^-\s*\[(Todo|InProgress|Done)\]\s*(?:\[(TASK-\d{3})\]\s*)?(.*)").unwrap()
+        Regex::new(r"^-\s*\[(Todo|InProgress|Done|Blocked)\]\s*(?:\[(TASK-\d{3})\]\s*)?(.*)").unwrap()
     });
 
     static LEGACY_CB_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -516,6 +674,7 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                 "Todo" => TaskStatus::Todo,
                 "InProgress" => TaskStatus::InProgress,
                 "Done" => TaskStatus::Done,
+                "Blocked" => TaskStatus::Blocked,
                 _ => continue,
             };
             tasks.push(Task {
@@ -613,7 +772,59 @@ mod tests {
         let rendered = render_context(&state);
         let state2 = parse_context(&rendered).unwrap();
         assert_eq!(state.current_phase, state2.current_phase);
-        assert_eq!(state.active_tasks.len(), state2.active_tasks.len());
+        // Done tasks are filtered from render output, so round-trip loses them.
+        assert_eq!(state2.active_tasks.len(), 1);
+        assert_eq!(state2.active_tasks[0].description, "Task A");
+    }
+
+    #[test]
+    fn test_render_context_filters_done() {
+        let state = RuntimeState {
+            current_phase: "implement".into(),
+            active_tasks: vec![
+                Task { id: "TASK-000".into(), description: "Todo task".into(), status: TaskStatus::Todo },
+                Task { id: "TASK-001".into(), description: "InProgress task".into(), status: TaskStatus::InProgress },
+                Task { id: "TASK-002".into(), description: "Done task".into(), status: TaskStatus::Done },
+                Task { id: "TASK-003".into(), description: "Blocked task".into(), status: TaskStatus::Blocked },
+            ],
+            done_tasks: vec![],
+            constraints: vec![],
+        };
+        let rendered = render_context(&state);
+        assert!(!rendered.contains("Done task"));
+        assert!(rendered.contains("Todo task"));
+        assert!(rendered.contains("InProgress task"));
+        assert!(rendered.contains("Blocked task"));
+    }
+
+    #[test]
+    fn test_parse_task_lines_blocked() {
+        let md = "- [Blocked] [TASK-001] test";
+        let tasks = parse_task_lines(md);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "TASK-001");
+        assert_eq!(tasks[0].description, "test");
+        assert!(matches!(tasks[0].status, TaskStatus::Blocked));
+    }
+
+    #[test]
+    fn test_roundtrip_excludes_done() {
+        let md = concat!(
+            "# Current Phase\n",
+            "implementation\n\n",
+            "# Active Tasks\n",
+            "- [Todo] [TASK-000] Active task\n",
+            "- [Done] [TASK-001] Finished task\n\n",
+            "# Constraints\n",
+            "- Limit memory\n"
+        );
+        let state = parse_context(md).unwrap();
+        assert_eq!(state.active_tasks.len(), 2);
+        let rendered = render_context(&state);
+        let state2 = parse_context(&rendered).unwrap();
+        assert_eq!(state2.active_tasks.len(), 1);
+        assert_eq!(state2.active_tasks[0].description, "Active task");
+        assert!(matches!(state2.active_tasks[0].status, TaskStatus::Todo));
     }
 
     // ── Legacy Chinese H2 format (v2 skill) ────────────────────────────
@@ -686,7 +897,7 @@ mod tests {
         assert_eq!(adrs.len(), 1);
         assert_eq!(adrs[0].id, "ADR-001");
         assert_eq!(adrs[0].title, "Use Rust for backend");
-        assert_eq!(adrs[0].status, "Accepted");
+        assert_eq!(adrs[0].status, AdrStatus::Accepted);
         assert_eq!(adrs[0].tags, vec!["rust", "backend", "performance"]);
     }
 
@@ -695,7 +906,7 @@ mod tests {
         let adr = ADR {
             id: "ADR-001".into(),
             title: "Test".into(),
-            status: "Accepted".into(),
+            status: AdrStatus::Accepted,
             context: "Some context.\nMore context.".into(),
             decision: "The decision.".into(),
             tags: vec!["a".into(), "b".into()],
@@ -737,11 +948,233 @@ mod tests {
             error_signature: "Timeout".into(),
             context: "Request took too long.".into(),
             solution: "Add timeout config.".into(),
+            root_cause: String::new(),
+            prevention: String::new(),
         };
         let rendered = render_trap(&trap);
         let parsed = parse_traps(&rendered).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].error_signature, "Timeout");
+    }
+
+    #[test]
+    fn test_parse_traps_with_root_cause_prevention() {
+        let md = concat!(
+            "## Trap: Race in cache\n\n",
+            "### Context\n",
+            "Concurrent writes corrupt state.\n\n",
+            "### Root Cause\n",
+            "Missing lock around shared map.\n\n",
+            "### Solution\n",
+            "Use RwLock for the cache.\n\n",
+            "### Prevention\n",
+            "Audit all shared mutable state.\n"
+        );
+        let traps = parse_traps(md).unwrap();
+        assert_eq!(traps.len(), 1);
+        assert_eq!(traps[0].error_signature, "Race in cache");
+        assert!(traps[0].context.contains("Concurrent writes"));
+        assert_eq!(traps[0].root_cause, "Missing lock around shared map.");
+        assert!(traps[0].solution.contains("RwLock"));
+        assert_eq!(traps[0].prevention, "Audit all shared mutable state.");
+    }
+
+    #[test]
+    fn test_render_trap_skips_empty_sections() {
+        let trap = Trap {
+            error_signature: "Leak".into(),
+            context: "Memory grows unbounded.".into(),
+            root_cause: String::new(),
+            solution: "Drop resources after use.".into(),
+            prevention: String::new(),
+        };
+        let rendered = render_trap(&trap);
+        assert!(rendered.contains("### Context"));
+        assert!(!rendered.contains("### Root Cause"));
+        assert!(rendered.contains("### Solution"));
+        assert!(!rendered.contains("### Prevention"));
+    }
+
+    #[test]
+    fn test_trap_roundtrip_all_fields() {
+        let original = Trap {
+            error_signature: "Deadlock".into(),
+            context: "Two threads wait forever.".into(),
+            root_cause: "Circular dependency on locks.".into(),
+            solution: "Enforce lock ordering.".into(),
+            prevention: "Use try_lock with timeout.".into(),
+        };
+        let rendered = render_trap(&original);
+        let parsed = parse_traps(&rendered).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let round = &parsed[0];
+        assert_eq!(round.error_signature, "Deadlock");
+        assert_eq!(round.context, "Two threads wait forever.");
+        assert_eq!(round.root_cause, "Circular dependency on locks.");
+        assert_eq!(round.solution, "Enforce lock ordering.");
+        assert_eq!(round.prevention, "Use try_lock with timeout.");
+    }
+
+    // ── ADR status partition ───────────────────────────────────────────
+
+    #[test]
+    fn test_adr_partition_by_status() {
+        let adrs = vec![
+            ADR {
+                id: "ADR-001".into(),
+                title: "Accepted".into(),
+                status: AdrStatus::Accepted,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-002".into(),
+                title: "Proposed".into(),
+                status: AdrStatus::Proposed,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-003".into(),
+                title: "Superseded".into(),
+                status: AdrStatus::Superseded,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-004".into(),
+                title: "Rejected".into(),
+                status: AdrStatus::Rejected,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-005".into(),
+                title: "Archived".into(),
+                status: AdrStatus::Archived,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+        ];
+
+        let active = render_active_decisions(&adrs);
+        assert!(active.contains("## ADR-001: Accepted"));
+        assert!(active.contains("## ADR-002: Proposed"));
+        assert!(!active.contains("## ADR-003:"));
+        assert!(!active.contains("## ADR-004:"));
+        assert!(!active.contains("## ADR-005:"));
+        assert!(
+            active.contains("> Historical decisions are in [decisions_archive.md](./decisions_archive.md)")
+        );
+
+        let stale = render_stale_decisions(&adrs);
+        assert!(stale.contains("## ADR-003: Superseded"));
+        assert!(stale.contains("## ADR-004: Rejected"));
+        assert!(stale.contains("## ADR-005: Archived"));
+        assert!(!stale.contains("## ADR-001:"));
+        assert!(!stale.contains("## ADR-002:"));
+    }
+
+    #[test]
+    fn test_roundtrip_adr_status() {
+        let adrs = vec![
+            ADR {
+                id: "ADR-001".into(),
+                title: "A".into(),
+                status: AdrStatus::Accepted,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-002".into(),
+                title: "P".into(),
+                status: AdrStatus::Proposed,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-003".into(),
+                title: "S".into(),
+                status: AdrStatus::Superseded,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-004".into(),
+                title: "R".into(),
+                status: AdrStatus::Rejected,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+            ADR {
+                id: "ADR-005".into(),
+                title: "Ar".into(),
+                status: AdrStatus::Archived,
+                context: "ctx".into(),
+                decision: "dec".into(),
+                tags: vec![],
+            },
+        ];
+
+        let rendered = render_decisions(&adrs);
+        let parsed = parse_decisions(&rendered).unwrap();
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[0].status, AdrStatus::Accepted);
+        assert_eq!(parsed[1].status, AdrStatus::Proposed);
+        assert_eq!(parsed[2].status, AdrStatus::Superseded);
+        assert_eq!(parsed[3].status, AdrStatus::Rejected);
+        assert_eq!(parsed[4].status, AdrStatus::Archived);
+    }
+
+    // ── tasks_archive global dedup ────────────────────────────────────
+
+    #[test]
+    fn test_append_tasks_archive_global_dedup() {
+        let existing = concat!(
+            "# Archived Tasks\n\n",
+            "## 2026-06-01\n",
+            "- [Done] [TASK-001] Old task\n\n",
+        );
+        let new_task = Task {
+            id: "TASK-001".into(),
+            description: "Same task".into(),
+            status: TaskStatus::Done,
+        };
+        let result = append_tasks_archive(existing, &[new_task], "2026-06-02");
+        // TASK-001 already exists globally — new section must NOT be created.
+        assert!(!result.contains("## 2026-06-02"));
+    }
+
+    #[test]
+    fn test_append_tasks_archive_keeps_earliest() {
+        let existing = concat!(
+            "# Archived Tasks\n\n",
+            "## 2026-06-01\n",
+            "- [Done] [TASK-001] First\n\n",
+        );
+        let new_task = Task {
+            id: "TASK-001".into(),
+            description: "Second".into(),
+            status: TaskStatus::Done,
+        };
+        let result = append_tasks_archive(existing, &[new_task], "2026-06-02");
+        // Should still only have TASK-001 in 2026-06-01.
+        assert!(result.contains("## 2026-06-01"));
+        assert!(result.contains("[TASK-001] First"));
+        // Should NOT have it in a 2026-06-02 section.
+        let parts: Vec<&str> = result.split("## 2026-06-02").collect();
+        if parts.len() > 1 {
+            assert!(!parts[1].contains("TASK-001"));
+        }
     }
 
 }

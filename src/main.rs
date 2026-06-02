@@ -1,6 +1,8 @@
+mod cli;
 mod engine;
 mod mcp;
 mod models;
+mod search;
 
 use crate::engine::state_manager::StateManager;
 use crate::mcp::server::McpServer;
@@ -61,6 +63,16 @@ fn resolve_project_root() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // ── CLI subcommand routing ──────────────────────────────────────
+    if std::env::args().nth(1).as_deref() == Some("cleanup") {
+        let args = cli::cleanup::CleanupArgs::parse();
+        if let Err(e) = cli::cleanup::run_cleanup(&args) {
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let project_root = resolve_project_root();
 
     eprintln!(
