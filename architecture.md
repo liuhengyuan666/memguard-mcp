@@ -1,7 +1,7 @@
 # MemGuard v3 — Architecture & Design Reference
 
 > **Runtime**: Rust MCP Server · Git-native · RwLock thread-safe · Source-of-Truth in Markdown
-> **Version**: 0.3.0 (core) / 4.0.0 (spec)
+> **Version**: 0.4.0 (core) / 4.1.0 (spec)
 > **Compatibility**: OpenCode MCP client
 
 ---
@@ -85,7 +85,8 @@ RuntimeState
 Task
 ├── id: String                     # e.g. "TASK-000"
 ├── description: String
-└── status: TaskStatus             # Todo | InProgress | Blocked | Done
+├── status: TaskStatus             # Todo | InProgress | Blocked | Done | Superseded | Cancelled
+└── superseded_by: Option<SupersededInfo>   # V4.1: only when status is Superseded
 
 ADR (Architecture Decision Record)
 ├── id, title, status              # status: AdrStatus 枚举（5 变体）
@@ -107,7 +108,8 @@ Trap
 └── prevention: String             # 预防措施（V4 新增）
 
 RuntimeEvent (enum, serde tagged)
-├── TaskUpdated { task_id, new_status }
+├── TaskCreated(Task)                         # V4: new tasks always start as Todo
+├── TaskUpdated { task_id, new_status, superseded_by? }  # V4.1: terminal states auto-archive
 ├── AdrCommitted(ADR)
 ├── TrapRecorded(Trap)
 └── PhaseChanged(String)
@@ -216,7 +218,7 @@ Tier 4: CLI 参数 args[1]
 | `ValidationError` | 包含 `validator_name`、`message`、`suggestion` |
 | `ValidatorRegistry` | 持有 `Vec<Box<dyn Validator>>`，提供 `validate_all()`（短路：第一个错误即返回） |
 
-**5 个内置验证器**：
+**7 个内置验证器**（V4.1 新增 2 个）：
 
 | 验证器 | 检测内容 |
 |---|---|
@@ -225,8 +227,10 @@ Tier 4: CLI 参数 args[1]
 | `AdrActiveConflict` | 同 ID 的 `Accepted` ADR 已存在且内容不同 |
 | `AdrRejectedRepeat` | 同 ID 的 `Rejected` ADR 已存在且内容完全相同 |
 | `AdrInvalidTransition` | ADR 状态转换不在 `valid_transitions()` 白名单中 |
+| `TaskTerminalTransition` | V4.1: 尝试从终态（Done/Superseded/Cancelled）转换 |
+| `SupersededByRequired` | V4.1: `TaskUpdated` 到 `Superseded` 时缺少 `superseded_by` |
 
-**集成点**：`StateManager::new()` 时注册全部 5 个验证器；`apply_event()` 第一步调用 `registry.validate_all()`。
+**集成点**：`StateManager::new()` 时注册全部 7 个验证器；`apply_event()` 第一步调用 `registry.validate_all()`。
 
 ---
 
@@ -263,7 +267,7 @@ terms: HashMap<String, Vec<(EntryType, usize)>>
 
 | 问题 | 处理方式 |
 |---|---|
-| Done tasks 仍在 `context.md` | 归档到 `tasks_archive.md`，按日期分组，全局 ID 去重 |
+| Done tasks 仍在 `context.md` | 归档到 `tasks_archive.md`，按状态分区（Completed/Superseded/Cancelled），按日期分组，全局 ID 去重 |
 | Stale ADRs（Superseded/Rejected/Archived）在 `decisions.md` | 迁移到 `decisions_archive.md` |
 | Duplicate ADRs（same title + same decision + different ID） | 保留高优先级版本，低优先级标记为 Superseded |
 
@@ -445,12 +449,12 @@ flush 任务（每个周期）:
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `src/main.rs` | ~124 | 入口点 + `resolve_project_root()` + CLI 子命令路由 |
-| `src/models.rs` | ~200 | 领域结构体：`TaskStatus`/`AdrStatus` 枚举、`RuntimeEvent`、`Trap` 扩展 |
+| `src/models.rs` | ~374 | 领域结构体：`TaskStatus` (6)/`AdrStatus` (5) 枚举、`Reference`、`SupersededInfo`、`RuntimeEvent` |
 | `src/cli/cleanup.rs` | ~695 | `memguard cleanup` 手动迁移工具（含 14 个集成测试） |
-| `src/engine/state_manager.rs` | ~1,050 | 状态机、防抖 flush、ADR 状态机、Validation Framework 集成 |
-| `src/engine/projection.rs` | ~1,118 | Markdown ↔ Rust 双向转换 + archive 分区 + 全局去重 |
+| `src/engine/state_manager.rs` | ~1,877 | 状态机、防抖 flush、ADR 状态机、Validation Framework 集成、终端自动归档 |
+| `src/engine/projection.rs` | ~1,291 | Markdown ↔ Rust 双向转换 + 3-section archive + 全局去重 |
 | `src/engine/validator.rs` | ~180 | `trait Validator` + `ValidationError` + `ValidatorRegistry` |
-| `src/engine/validators/*.rs` | ~5×150 | 5 个具体验证器 + 共享 `content_hash()` |
+| `src/engine/validators/*.rs` | ~7×100 | 7 个具体验证器（含 V4.1 `TaskTerminalTransition` + `SupersededByRequired`） |
 | `src/search/scorer.rs` | ~180 | `score_match_v3` + `ngram_jaccard` + `contains_word` |
 | `src/search/index.rs` | ~580 | `SearchIndex` + 倒排索引 + `to_index_json()` |
 | `src/mcp/server.rs` | ~1,048 | MCP JSON-RPC 2.0、工具路由、initialize 自动修正 |

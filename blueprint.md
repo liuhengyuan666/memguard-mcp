@@ -1,4 +1,4 @@
-# MemGuard v3: Git-Native MCP Runtime Engine (架构与实现蓝图)
+# MemGuard v4: Git-Native MCP Runtime Engine (架构与实现蓝图)
 
 ## 1. 架构哲学与核心约束 (Architecture Philosophy)
 
