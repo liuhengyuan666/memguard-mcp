@@ -2,7 +2,7 @@ use crate::engine::projection;
 use crate::engine::validator::ValidatorRegistry;
 use crate::engine::validators::{
     content_hash, AdrActiveConflict, AdrInvalidTransition, AdrRejectedRepeat, DuplicateTaskId,
-    EmptyTaskId,
+    EmptyTaskId, SupersededByRequired, TaskTerminalTransition,
 };
 use crate::models::*;
 use crate::search::index::SearchIndex;
@@ -180,6 +180,8 @@ impl StateManager {
         registry.register(Box::new(AdrActiveConflict));
         registry.register(Box::new(AdrRejectedRepeat));
         registry.register(Box::new(AdrInvalidTransition));
+        registry.register(Box::new(TaskTerminalTransition));
+        registry.register(Box::new(SupersededByRequired));
 
         Self {
             state,
@@ -360,10 +362,15 @@ impl StateManager {
             RuntimeEvent::TaskUpdated {
                 task_id,
                 new_status,
+                superseded_by,
             } => {
                 let mut state = self.state.write().await;
-                if new_status == TaskStatus::Done {
-                    // Move Done task from active_tasks to done_tasks for archival.
+                let is_terminal = matches!(
+                    new_status,
+                    TaskStatus::Done | TaskStatus::Superseded | TaskStatus::Cancelled
+                );
+                if is_terminal {
+                    // Move terminal-status tasks from active_tasks to done_tasks for archival.
                     let idx = state
                         .active_tasks
                         .iter()
@@ -372,7 +379,10 @@ impl StateManager {
                             anyhow::anyhow!("Task not found: {}", task_id)
                         })?;
                     let mut task = state.active_tasks.remove(idx);
-                    task.status = TaskStatus::Done;
+                    task.status = new_status;
+                    if let Some(info) = superseded_by {
+                        task.superseded_by = Some(info);
+                    }
                     state.done_tasks.push(task);
                 } else {
                     let task = state
@@ -986,16 +996,18 @@ mod tests {
         {
             let mut state = mgr.state.write().await;
             state.active_tasks.push(Task {
-                id: "TASK-000".into(),
-                description: "Test task".into(),
-                status: TaskStatus::Todo,
-            });
+            id: "TASK-000".into(),
+            description: "Test task".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        });
         }
 
         // Update the task.
         mgr.apply_event(RuntimeEvent::TaskUpdated {
             task_id: "TASK-000".into(),
             new_status: TaskStatus::Done,
+            superseded_by: None,
         })
         .await
         .expect("apply should succeed");
@@ -1016,9 +1028,10 @@ mod tests {
 
         let result = mgr
             .apply_event(RuntimeEvent::TaskUpdated {
-                task_id: "nonexistent".into(),
-                new_status: TaskStatus::Done,
-            })
+            task_id: "nonexistent".into(),
+            new_status: TaskStatus::Done,
+            superseded_by: None,
+        })
             .await;
         assert!(result.is_err());
     }
@@ -1128,10 +1141,11 @@ mod tests {
             let mut state = mgr.state.write().await;
             state.current_phase = "testing".to_string();
             state.active_tasks.push(Task {
-                id: "TASK-000".into(),
-                description: "Flush test".into(),
-                status: TaskStatus::InProgress,
-            });
+            id: "TASK-000".into(),
+            description: "Flush test".into(),
+            status: TaskStatus::InProgress,
+            superseded_by: None,
+        });
             state
                 .constraints
                 .push("Must flush correctly".into());
@@ -1570,6 +1584,7 @@ old dec
             id: "TASK-011".into(),
             description: "New task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         mgr.apply_event(event).await.unwrap();
 
@@ -1593,6 +1608,7 @@ old dec
             id: "".into(),
             description: "Invalid task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = mgr.apply_event(event).await;
         assert!(result.is_err(), "should reject empty task ID");
@@ -1610,6 +1626,7 @@ old dec
             id: "TASK-011".into(),
             description: "First task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         mgr.apply_event(event1).await.unwrap();
 
@@ -1618,6 +1635,7 @@ old dec
             id: "TASK-011".into(),
             description: "Duplicate task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = mgr.apply_event(event2).await;
         assert!(result.is_err(), "should reject duplicate task ID");
@@ -1728,10 +1746,11 @@ old dec
         // Create two tasks and mark them Done.
         for (id, desc) in &[("TASK-001", "First task"), ("TASK-002", "Second task")] {
             mgr.apply_event(RuntimeEvent::TaskCreated(Task {
-                id: id.to_string(),
-                description: desc.to_string(),
-                status: TaskStatus::Todo,
-            }))
+            id: id.to_string(),
+            description: desc.to_string(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
             .await
             .unwrap();
         }
@@ -1739,12 +1758,14 @@ old dec
         mgr.apply_event(RuntimeEvent::TaskUpdated {
             task_id: "TASK-001".into(),
             new_status: TaskStatus::Done,
+            superseded_by: None,
         })
         .await
         .unwrap();
         mgr.apply_event(RuntimeEvent::TaskUpdated {
             task_id: "TASK-002".into(),
             new_status: TaskStatus::Done,
+            superseded_by: None,
         })
         .await
         .unwrap();
@@ -1790,6 +1811,7 @@ old dec
             id: "TASK-000".into(),
             description: "Only task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         }))
         .await
         .unwrap();
@@ -1798,6 +1820,7 @@ old dec
         mgr.apply_event(RuntimeEvent::TaskUpdated {
             task_id: "TASK-000".into(),
             new_status: TaskStatus::Done,
+            superseded_by: None,
         })
         .await
         .unwrap();
@@ -1808,9 +1831,10 @@ old dec
         // Second Done-marking should fail (task no longer in active_tasks).
         let result = mgr
             .apply_event(RuntimeEvent::TaskUpdated {
-                task_id: "TASK-000".into(),
-                new_status: TaskStatus::Done,
-            })
+            task_id: "TASK-000".into(),
+            new_status: TaskStatus::Done,
+            superseded_by: None,
+        })
             .await;
         assert!(result.is_err(), "second Done should fail — task not in active");
 

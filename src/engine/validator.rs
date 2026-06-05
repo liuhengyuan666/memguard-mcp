@@ -259,6 +259,7 @@ mod tests {
             id: "T1".into(),
             description: "test".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         };
 
         let result = reg.validate_all(

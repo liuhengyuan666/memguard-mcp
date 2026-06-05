@@ -70,6 +70,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "test".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &empty_state(), &[], &empty_traps());
         assert!(result.is_ok());

@@ -43,10 +43,11 @@ mod tests {
         RuntimeState {
             current_phase: String::new(),
             active_tasks: vec![Task {
-                id: id.to_string(),
-                description: "existing".into(),
-                status: TaskStatus::Todo,
-            }],
+            id: id.to_string(),
+            description: "existing".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }],
             done_tasks: vec![],
             constraints: vec![],
         }
@@ -85,6 +86,7 @@ mod tests {
             id: "TASK-002".into(),
             description: "unique".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &state, &empty_decisions(), &empty_traps());
         assert!(result.is_ok(), "unique ID should pass");
@@ -97,6 +99,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "first task".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &empty_state(), &empty_decisions(), &empty_traps());
         assert!(result.is_ok(), "empty state should always pass");
@@ -110,6 +113,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "duplicate".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &state, &empty_decisions(), &empty_traps());
         assert!(result.is_err());

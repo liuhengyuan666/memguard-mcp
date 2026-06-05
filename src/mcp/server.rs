@@ -288,7 +288,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.3.3"
+                "version": "0.4.0"
             }
         }))
     }
@@ -444,7 +444,12 @@ impl McpServer {
         let tasks: Vec<Value> = state
             .active_tasks
             .iter()
-            .filter(|t| !matches!(t.status, TaskStatus::Done))
+            .filter(|t| {
+                !matches!(
+                    t.status,
+                    TaskStatus::Done | TaskStatus::Superseded | TaskStatus::Cancelled
+                )
+            })
             .map(|t| {
                 serde_json::json!({
                     "id": t.id,
@@ -606,16 +611,23 @@ fn parse_event(event_type: &str, payload: &Value) -> Result<RuntimeEvent, McpErr
                 "Todo" => TaskStatus::Todo,
                 "InProgress" => TaskStatus::InProgress,
                 "Done" => TaskStatus::Done,
+                "Blocked" => TaskStatus::Blocked,
+                "Superseded" => TaskStatus::Superseded,
+                "Cancelled" => TaskStatus::Cancelled,
                 other => {
                     return Err(McpError::InvalidParams(format!(
-                        "Invalid task status: {} (expected Todo|InProgress|Done)",
+                        "Invalid task status: {} (expected Todo|InProgress|Blocked|Done|Superseded|Cancelled)",
                         other
                     )));
                 }
             };
+            let superseded_by = payload.get("superseded_by")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
             Ok(RuntimeEvent::TaskUpdated {
                 task_id,
                 new_status,
+                superseded_by,
             })
         }
         "AdrCommitted" => {
@@ -656,10 +668,11 @@ fn parse_event(event_type: &str, payload: &Value) -> Result<RuntimeEvent, McpErr
                     ))
                 })?;
             Ok(RuntimeEvent::TaskCreated(crate::models::Task {
-                id: payload.id,
-                description: payload.description,
-                status: crate::models::TaskStatus::Todo,
-            }))
+            id: payload.id,
+            description: payload.description,
+            status: crate::models::TaskStatus::Todo,
+            superseded_by: None,
+        }))
         }
         other => Err(McpError::InvalidParams(format!(
             "Unknown event_type: {}",
@@ -1009,25 +1022,29 @@ mod tests {
             let mut state = sm.state.write().await;
             state.active_tasks = vec![
                 Task {
-                    id: "TASK-001".into(),
-                    description: "Todo task".into(),
-                    status: TaskStatus::Todo,
-                },
+            id: "TASK-001".into(),
+            description: "Todo task".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        },
                 Task {
-                    id: "TASK-002".into(),
-                    description: "InProgress task".into(),
-                    status: TaskStatus::InProgress,
-                },
+            id: "TASK-002".into(),
+            description: "InProgress task".into(),
+            status: TaskStatus::InProgress,
+            superseded_by: None,
+        },
                 Task {
-                    id: "TASK-003".into(),
-                    description: "Done task".into(),
-                    status: TaskStatus::Done,
-                },
+            id: "TASK-003".into(),
+            description: "Done task".into(),
+            status: TaskStatus::Done,
+            superseded_by: None,
+        },
                 Task {
-                    id: "TASK-004".into(),
-                    description: "Blocked task".into(),
-                    status: TaskStatus::Blocked,
-                },
+            id: "TASK-004".into(),
+            description: "Blocked task".into(),
+            status: TaskStatus::Blocked,
+            superseded_by: None,
+        },
             ];
         }
 

@@ -10,6 +10,8 @@ pub mod duplicate_task_id;
 pub mod adr_active_conflict;
 pub mod adr_rejected_repeat;
 pub mod adr_invalid_transition;
+pub mod task_terminal_transition;
+pub mod superseded_by_required;
 
 pub use self::{
     empty_task_id::EmptyTaskId,
@@ -17,6 +19,8 @@ pub use self::{
     adr_active_conflict::AdrActiveConflict,
     adr_rejected_repeat::AdrRejectedRepeat,
     adr_invalid_transition::AdrInvalidTransition,
+    task_terminal_transition::TaskTerminalTransition,
+    superseded_by_required::SupersededByRequired,
 };
 
 use crate::models::ADR;

@@ -85,7 +85,12 @@ pub fn analyze(
         completed_tasks: state
             .active_tasks
             .iter()
-            .filter(|t| matches!(t.status, TaskStatus::Done))
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Done | TaskStatus::Superseded | TaskStatus::Cancelled
+                )
+            })
             .cloned()
             .collect(),
         ..Default::default()
@@ -561,7 +566,7 @@ mod tests {
     }
 
     fn make_task(id: &str, desc: &str, status: TaskStatus) -> Task {
-        Task { id: id.to_string(), description: desc.to_string(), status }
+        Task { id: id.to_string(), description: desc.to_string(), status, superseded_by: None }
     }
 
     #[test]

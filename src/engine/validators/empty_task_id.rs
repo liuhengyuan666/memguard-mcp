@@ -70,6 +70,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "valid".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &empty_state(), &empty_decisions(), &empty_traps());
         assert!(result.is_ok(), "non-empty ID should pass");
@@ -82,6 +83,7 @@ mod tests {
             id: "".into(),
             description: "invalid".into(),
             status: TaskStatus::Todo,
+            superseded_by: None,
         });
         let result = validator.validate(&event, &empty_state(), &empty_decisions(), &empty_traps());
         assert!(result.is_err());

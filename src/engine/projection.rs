@@ -125,6 +125,8 @@ pub fn render_context(state: &RuntimeState) -> String {
                 TaskStatus::InProgress => "InProgress",
                 TaskStatus::Done => "Done",
                 TaskStatus::Blocked => "Blocked",
+                TaskStatus::Superseded => "Superseded",
+                TaskStatus::Cancelled => "Cancelled",
             };
             md.push_str(&format!("- [{}] [{}] {}\n", status, task.id, task.description));
         }
@@ -155,13 +157,61 @@ fn extract_task_ids(md: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Append newly Done tasks to an existing tasks_archive.md content.
+/// Categorise a terminal task into its archive section name.
+fn archive_section(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Done => "Completed",
+        TaskStatus::Superseded => "Superseded",
+        TaskStatus::Cancelled => "Cancelled",
+        _ => "Completed",
+    }
+}
+
+/// Render a single archived task line (and optional Superseded metadata).
+fn render_archived_task(t: &Task) -> String {
+    let status_label = match t.status {
+        TaskStatus::Done => "Done",
+        TaskStatus::Superseded => "Superseded",
+        TaskStatus::Cancelled => "Cancelled",
+        _ => "Done",
+    };
+    let mut out = format!("- [{}] [{}] {}\n", status_label, t.id, t.description);
+    if let Some(info) = &t.superseded_by {
+        let ref_str = match &info.reference {
+            Reference::Task(id) => format!("Task {}", id),
+            Reference::Adr(id) => format!("ADR {}", id),
+        };
+        out.push_str(&format!("  Superseded by: {}\n", ref_str));
+        if !info.reason.is_empty() {
+            out.push_str(&format!("  Reason: {}\n", info.reason));
+        }
+    }
+    out
+}
+
+/// Append terminal-status tasks to tasks_archive.md with three top-level sections.
 ///
-/// Groups entries by date.  If `existing` already contains today's section,
-/// new entries are appended within it; otherwise a new date heading is created.
+/// ```markdown
+/// # Archived Tasks
 ///
-/// Tasks whose IDs already appear ANYWHERE in the existing archive are
-/// silently skipped (globally deduplicated, keeping the earliest date).
+/// ## Completed
+/// ### 2026-06-02
+/// - [Done] [TASK-001] desc
+///
+/// ## Superseded
+/// ### 2026-06-02
+/// - [Superseded] [TASK-011] desc
+///   Superseded by: ADR-053
+///   Reason: Ground Truth generation redesigned
+///
+/// ## Cancelled
+/// ### 2026-06-02
+/// - [Cancelled] [TASK-028] desc
+/// ```
+///
+/// Global deduplication by task ID across all sections.
+/// If the existing file uses the old flat format (no `## Completed` header),
+/// it is transparently migrated on first write.
 pub fn append_tasks_archive(
     existing: &str,
     new_tasks: &[Task],
@@ -174,52 +224,88 @@ pub fn append_tasks_archive(
         .filter(|t| !existing_ids.contains(&t.id))
         .collect();
 
-    if tasks_to_add.is_empty() {
+    if tasks_to_add.is_empty() && !existing.is_empty() {
         return existing.to_string();
     }
 
-    let title = "# Archived Tasks\n\n";
+    // ── Parse existing content into sections ─────────────────────────
+    // If the file is empty or uses the old flat format, start from scratch.
+    let mut completed = String::new();
+    let mut superseded = String::new();
+    let mut cancelled = String::new();
 
-    if existing.is_empty() {
-        let mut out = title.to_string();
-        out.push_str(&format!("## {}\n", today_date));
-        for t in tasks_to_add {
-            out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
+    if !existing.trim().is_empty() && existing.contains("## Completed") {
+        // New-format file — split into three sections.
+        // We don't need to parse deeply; we'll keep the existing text
+        // and append new entries into the right sections.
+        // For simplicity, we rebuild the file from scratch each time,
+        // preserving existing entries by re-inserting them.
+        // This is acceptable because the archive file is small.
+        let mut current_section: Option<&str> = None;
+        for line in existing.lines() {
+            if line.trim() == "## Completed" {
+                current_section = Some("completed");
+                continue;
+            } else if line.trim() == "## Superseded" {
+                current_section = Some("superseded");
+                continue;
+            } else if line.trim() == "## Cancelled" {
+                current_section = Some("cancelled");
+                continue;
+            }
+            match current_section {
+                Some("completed") => completed.push_str(&format!("{}\n", line)),
+                Some("superseded") => superseded.push_str(&format!("{}\n", line)),
+                Some("cancelled") => cancelled.push_str(&format!("{}\n", line)),
+                _ => {}
+            }
         }
-        out.push('\n');
-        return out;
+    } else if !existing.trim().is_empty() {
+        // Old-format file — migrate all existing entries to Completed.
+        completed = existing.to_string();
     }
 
-    // Check if today's date already has a section heading.
-    let today_header = format!("## {}", today_date);
-    if let Some(pos) = existing.find(&today_header) {
-        // Find the end of this section (next `## ` header or EOF).
-        let after_header = &existing[pos..];
-        let next_section = after_header[today_header.len()..]
-            .find("\n## ");
-        let section_end = next_section
-            .map(|i| pos + today_header.len() + i)
-            .unwrap_or(existing.len());
-        let mut out = existing[..section_end].to_string();
-        for t in &tasks_to_add {
-            out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
-        }
-        // Append trailing content after this section.
-        if section_end < existing.len() {
-            out.push_str(&existing[section_end..]);
-        } else {
-            out.push('\n');
-        }
-        return out;
-    }
-
-    // No today section — append new section at the end.
-    let mut out = existing.trim_end().to_string();
-    out.push_str(&format!("\n\n## {}\n", today_date));
+    // ── Append new tasks into the correct section buffers ────────────
     for t in &tasks_to_add {
-        out.push_str(&format!("- [Done] [{}] {}\n", t.id, t.description));
+        let section = match t.status {
+            TaskStatus::Done => &mut completed,
+            TaskStatus::Superseded => &mut superseded,
+            TaskStatus::Cancelled => &mut cancelled,
+            _ => &mut completed,
+        };
+
+        // Check if today's date subsection already exists in this section.
+        let today_header = format!("### {}", today_date);
+        if section.contains(&today_header) {
+            // Find the end of today's subsection and insert before it.
+            // Simple heuristic: append at the end of the section buffer
+            // (date ordering is not strictly required for V4.1).
+            section.push_str(&render_archived_task(t));
+        } else {
+            section.push_str(&format!("\n### {}\n", today_date));
+            section.push_str(&render_archived_task(t));
+        }
     }
-    out.push('\n');
+
+    // ── Reassemble ───────────────────────────────────────────────────
+    let mut out = "# Archived Tasks\n\n".to_string();
+
+    if !completed.trim().is_empty() {
+        out.push_str("## Completed\n");
+        out.push_str(&completed);
+        out.push('\n');
+    }
+    if !superseded.trim().is_empty() {
+        out.push_str("## Superseded\n");
+        out.push_str(&superseded);
+        out.push('\n');
+    }
+    if !cancelled.trim().is_empty() {
+        out.push_str("## Cancelled\n");
+        out.push_str(&cancelled);
+        out.push('\n');
+    }
+
     out
 }
 
@@ -681,6 +767,7 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                 id,
                 description: desc,
                 status,
+                superseded_by: None,
             });
             continue;
         }
@@ -693,6 +780,7 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                     id: format!("TASK-{:03}", tasks.len()),
                     description: desc,
                     status: TaskStatus::Todo,
+                    superseded_by: None,
                 });
             }
             continue;
@@ -707,6 +795,7 @@ fn parse_task_lines(rest: &str) -> Vec<Task> {
                     id: format!("TASK-{:03}", tasks.len()),
                     description: desc,
                     status: TaskStatus::Todo,
+                    superseded_by: None,
                 });
             }
         }
@@ -782,10 +871,30 @@ mod tests {
         let state = RuntimeState {
             current_phase: "implement".into(),
             active_tasks: vec![
-                Task { id: "TASK-000".into(), description: "Todo task".into(), status: TaskStatus::Todo },
-                Task { id: "TASK-001".into(), description: "InProgress task".into(), status: TaskStatus::InProgress },
-                Task { id: "TASK-002".into(), description: "Done task".into(), status: TaskStatus::Done },
-                Task { id: "TASK-003".into(), description: "Blocked task".into(), status: TaskStatus::Blocked },
+                Task {
+            id: "TASK-000".into(),
+            description: "Todo task".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        },
+                Task {
+            id: "TASK-001".into(),
+            description: "InProgress task".into(),
+            status: TaskStatus::InProgress,
+            superseded_by: None,
+        },
+                Task {
+            id: "TASK-002".into(),
+            description: "Done task".into(),
+            status: TaskStatus::Done,
+            superseded_by: None,
+        },
+                Task {
+            id: "TASK-003".into(),
+            description: "Blocked task".into(),
+            status: TaskStatus::Blocked,
+            superseded_by: None,
+        },
             ],
             done_tasks: vec![],
             constraints: vec![],
@@ -1148,6 +1257,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "Same task".into(),
             status: TaskStatus::Done,
+            superseded_by: None,
         };
         let result = append_tasks_archive(existing, &[new_task], "2026-06-02");
         // TASK-001 already exists globally — new section must NOT be created.
@@ -1165,6 +1275,7 @@ mod tests {
             id: "TASK-001".into(),
             description: "Second".into(),
             status: TaskStatus::Done,
+            superseded_by: None,
         };
         let result = append_tasks_archive(existing, &[new_task], "2026-06-02");
         // Should still only have TASK-001 in 2026-06-01.

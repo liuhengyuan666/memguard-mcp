@@ -6,6 +6,24 @@ pub enum TaskStatus {
     InProgress,
     Done,
     Blocked,
+    Superseded,
+    Cancelled,
+}
+
+/// Reference to another project artifact (Task or ADR).
+/// Used by `SupersededInfo` to establish a single causal chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id")]
+pub enum Reference {
+    Task(String),
+    Adr(String),
+}
+
+/// Metadata for a task that has been superseded by another task or ADR.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupersededInfo {
+    pub reference: Reference,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +31,8 @@ pub struct Task {
     pub id: String,
     pub description: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub superseded_by: Option<SupersededInfo>,
 }
 
 /// Payload for TaskCreated events — does not include `status` because
@@ -129,6 +149,8 @@ pub enum RuntimeEvent {
     TaskUpdated {
         task_id: String,
         new_status: TaskStatus,
+        #[serde(default)]
+        superseded_by: Option<SupersededInfo>,
     },
     AdrCommitted(ADR),
     TrapRecorded(Trap),
@@ -233,5 +255,120 @@ mod tests {
         assert_eq!(decoded.solution, "sol");
         assert_eq!(decoded.root_cause, "root");
         assert_eq!(decoded.prevention, "prev");
+    }
+
+    #[test]
+    fn test_task_status_superseded_serde() {
+        let status = TaskStatus::Superseded;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"Superseded\"");
+        let decoded: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, TaskStatus::Superseded));
+    }
+
+    #[test]
+    fn test_task_status_cancelled_serde() {
+        let status = TaskStatus::Cancelled;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"Cancelled\"");
+        let decoded: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, TaskStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_reference_adr_serde() {
+        let reference = Reference::Adr("ADR-053".to_string());
+        let json = serde_json::to_string(&reference).unwrap();
+        assert_eq!(json, r#"{"type":"Adr","id":"ADR-053"}"#);
+        let decoded: Reference = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, Reference::Adr("ADR-053".to_string()));
+    }
+
+    #[test]
+    fn test_reference_task_serde() {
+        let reference = Reference::Task("TASK-015".to_string());
+        let json = serde_json::to_string(&reference).unwrap();
+        assert_eq!(json, r#"{"type":"Task","id":"TASK-015"}"#);
+        let decoded: Reference = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, Reference::Task("TASK-015".to_string()));
+    }
+
+    #[test]
+    fn test_superseded_info_serde() {
+        let info = SupersededInfo {
+            reference: Reference::Adr("ADR-053".to_string()),
+            reason: "Ground Truth generation redesigned".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: SupersededInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.reference, info.reference);
+        assert_eq!(decoded.reason, info.reason);
+    }
+
+    #[test]
+    fn test_task_backward_compat_without_superseded_by() {
+        let old_json = r#"{"id":"TASK-001","description":"desc","status":"Todo"}"#;
+        let task: Task = serde_json::from_str(old_json).unwrap();
+        assert_eq!(task.id, "TASK-001");
+        assert_eq!(task.description, "desc");
+        assert!(matches!(task.status, TaskStatus::Todo));
+        assert!(task.superseded_by.is_none());
+    }
+
+    #[test]
+    fn test_task_with_superseded_by() {
+        let task = Task {
+            id: "TASK-011".to_string(),
+            description: "Old approach".to_string(),
+            status: TaskStatus::Superseded,
+            superseded_by: Some(SupersededInfo {
+                reference: Reference::Adr("ADR-053".to_string()),
+                reason: "Redesigned".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let decoded: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, task.id);
+        assert!(matches!(decoded.status, TaskStatus::Superseded));
+        assert!(decoded.superseded_by.is_some());
+        let info = decoded.superseded_by.unwrap();
+        assert_eq!(info.reference, Reference::Adr("ADR-053".to_string()));
+        assert_eq!(info.reason, "Redesigned");
+    }
+
+    #[test]
+    fn test_task_updated_event_with_superseded_by() {
+        let event = RuntimeEvent::TaskUpdated {
+            task_id: "TASK-011".to_string(),
+            new_status: TaskStatus::Superseded,
+            superseded_by: Some(SupersededInfo {
+                reference: Reference::Adr("ADR-053".to_string()),
+                reason: "Redesigned".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: RuntimeEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RuntimeEvent::TaskUpdated { task_id, new_status, superseded_by } => {
+                assert_eq!(task_id, "TASK-011");
+                assert!(matches!(new_status, TaskStatus::Superseded));
+                assert!(superseded_by.is_some());
+            }
+            _ => panic!("expected TaskUpdated"),
+        }
+    }
+
+    #[test]
+    fn test_task_updated_event_backward_compat() {
+        let old_json = r#"{"type":"TaskUpdated","payload":{"task_id":"TASK-001","new_status":"Done"}}"#;
+        let event: RuntimeEvent = serde_json::from_str(old_json).unwrap();
+        match event {
+            RuntimeEvent::TaskUpdated { task_id, new_status, superseded_by } => {
+                assert_eq!(task_id, "TASK-001");
+                assert!(matches!(new_status, TaskStatus::Done));
+                assert!(superseded_by.is_none());
+            }
+            _ => panic!("expected TaskUpdated"),
+        }
     }
 }
