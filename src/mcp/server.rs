@@ -352,6 +352,20 @@ impl McpServer {
                         },
                         "required": ["query_intent"]
                     }
+                },
+                {
+                    "name": "runtime_task_lookup",
+                    "description": "Look up a task by ID to determine its status, location (active/done/archived), and whether it has been superseded. Call before creating or updating a task.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task ID to look up, e.g. TASK-011"
+                            }
+                        },
+                        "required": ["task_id"]
+                    }
                 }
             ]
         }))
@@ -378,6 +392,9 @@ impl McpServer {
             }
             "runtime_query_memory" => {
                 self.tool_runtime_query_memory(arguments).await
+            }
+            "runtime_task_lookup" => {
+                self.tool_runtime_task_lookup(arguments).await
             }
             other => Err(McpError::MethodNotFound(format!(
                 "Unknown tool: {}",
@@ -462,6 +479,7 @@ impl McpServer {
         // Order: decisions & constraints first, tasks last.
         // This prevents the bootstrap output from biasing toward
         // task-management over architectural continuity.
+        let health = self.state_manager.memory_health().await;
         Ok(serde_json::json!({
             "content": [{
                 "type": "text",
@@ -471,6 +489,7 @@ impl McpServer {
                     "latest_adr": latest_adr,
                     "adr_count": adr_count,
                     "trap_count": trap_count,
+                    "memory_health": health,
                     "active_tasks": tasks,
                 })).unwrap_or_default()
             }]
@@ -587,6 +606,43 @@ impl McpServer {
                     "results": items,
                     "total": items.len(),
                 })).unwrap_or_default()
+            }]
+        }))
+    }
+
+    /// runtime_task_lookup: query a task by ID across active, done, and archived sources.
+    async fn tool_runtime_task_lookup(
+        &self,
+        args: Value,
+    ) -> Result<Value, McpError> {
+        let task_id = args["task_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("Missing task_id".into()))?
+            .to_string();
+
+        let index = self.state_manager.task_index.read().await;
+        let result = if let Some(entry) = index.get(&task_id) {
+            serde_json::json!({
+                "found": true,
+                "id": entry.id,
+                "status": format!("{:?}", entry.status),
+                "description": entry.description,
+                "location": format!("{:?}", entry.location),
+                "archived_date": entry.archived_date,
+                "superseded_by": entry.superseded_by,
+            })
+        } else {
+            serde_json::json!({
+                "found": false,
+                "id": task_id,
+                "message": "Task has never been created",
+            })
+        };
+
+        Ok(serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&result).unwrap_or_default()
             }]
         }))
     }

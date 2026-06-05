@@ -7,6 +7,7 @@ use crate::engine::validators::{
 use crate::models::*;
 use crate::search::index::SearchIndex;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,6 +26,8 @@ pub struct StateManager {
     pub decisions: Arc<RwLock<Vec<ADR>>>,
     pub traps: Arc<RwLock<Vec<Trap>>>,
     pub project_root: Arc<RwLock<PathBuf>>,
+    /// O(1) task lookup index — built at bootstrap, kept in sync by apply_event.
+    pub task_index: Arc<RwLock<HashMap<String, TaskIndexEntry>>>,
     flush_generation: Arc<AtomicU64>,
     flush_tx: mpsc::UnboundedSender<()>,
     /// Set to true when context.md was successfully parsed (or user committed
@@ -120,6 +123,8 @@ impl StateManager {
         let s = state.clone();
         let d = decisions.clone();
         let t = traps.clone();
+        let task_index = Arc::new(RwLock::new(HashMap::new()));
+        let task_index_for_task = task_index.clone();
         let root = Arc::new(RwLock::new(project_root));
         let root_for_task = root.clone();
         let flush_generation = Arc::new(AtomicU64::new(0));
@@ -162,7 +167,7 @@ impl StateManager {
                     continue;
                 }
 
-                flush_inner(&s, &d, &t, &root_path, &ctx_ok, &dec_ok, &trp_ok).await.unwrap_or_else(|e| {
+                flush_inner(&s, &d, &t, &task_index_for_task, &root_path, &ctx_ok, &dec_ok, &trp_ok).await.unwrap_or_else(|e| {
                     eprintln!("[memguard] flush error: {}", e);
                 });
 
@@ -188,6 +193,7 @@ impl StateManager {
             decisions,
             traps,
             project_root: root,
+            task_index: Arc::new(RwLock::new(HashMap::new())),
             flush_generation,
             flush_tx,
             context_ok,
@@ -294,6 +300,9 @@ impl StateManager {
 
         let loaded = load_state_from_disk(&project_root).await?;
 
+        // Build TaskIndex BEFORE moving loaded.state
+        let task_index = build_task_index(&loaded.state, &project_root).await;
+
         // Atomic swap: acquire all three write locks in consistent order.
         {
             let mut s = self.state.write().await;
@@ -329,10 +338,29 @@ impl StateManager {
                 .context("Failed to write default memory/traps.md")?;
         }
 
+        // ── Store TaskIndex ─────────────────────────────────────────
+        {
+            let mut index = self.task_index.write().await;
+            *index = task_index;
+        }
+
         // ── Always write cache files ────────────────────────────────
         self.write_cache().await?;
 
         Ok(())
+    }
+
+    /// Compute a MemoryHealth snapshot from current state.
+    pub async fn memory_health(&self) -> MemoryHealth {
+        let decisions = self.decisions.read().await;
+        let state = self.state.read().await;
+        let traps = self.traps.read().await;
+        MemoryHealth {
+            adr_count: decisions.len(),
+            active_tasks: state.active_tasks.len(),
+            done_tasks: state.done_tasks.len(),
+            traps: traps.len(),
+        }
     }
 
     // ── Event processing ──────────────────────────────────────────────
@@ -376,12 +404,12 @@ impl StateManager {
                         .iter()
                         .position(|t| t.id == task_id)
                         .ok_or_else(|| {
-                            anyhow::anyhow!("Task not found: {}", task_id)
+                            anyhow::anyhow!("Task {} has never been created.", task_id)
                         })?;
                     let mut task = state.active_tasks.remove(idx);
-                    task.status = new_status;
-                    if let Some(info) = superseded_by {
-                        task.superseded_by = Some(info);
+                    task.status = new_status.clone();
+                    if let Some(ref info) = superseded_by {
+                        task.superseded_by = Some(info.clone());
                     }
                     state.done_tasks.push(task);
                 } else {
@@ -390,11 +418,22 @@ impl StateManager {
                         .iter_mut()
                         .find(|t| t.id == task_id)
                         .ok_or_else(|| {
-                            anyhow::anyhow!("Task not found: {}", task_id)
+                            anyhow::anyhow!("Task {} has never been created.", task_id)
                         })?;
-                    task.status = new_status;
+                    task.status = new_status.clone();
                 }
-                // Lock dropped here (end of scope).
+                // Update TaskIndex
+                drop(state);
+                let mut index = self.task_index.write().await;
+                if let Some(entry) = index.get_mut(&task_id) {
+                    entry.status = new_status.clone();
+                    if is_terminal {
+                        entry.location = TaskLocation::DoneQueue;
+                    }
+                    if let Some(info) = superseded_by {
+                        entry.superseded_by = Some(info);
+                    }
+                }
             }
 
             RuntimeEvent::TaskCreated(task) => {
@@ -403,7 +442,18 @@ impl StateManager {
                 // Always start as Todo regardless of caller input.
                 let mut task = task;
                 task.status = TaskStatus::Todo;
+                let entry = TaskIndexEntry {
+                    id: task.id.clone(),
+                    status: task.status.clone(),
+                    description: task.description.clone(),
+                    location: TaskLocation::Active,
+                    superseded_by: task.superseded_by.clone(),
+                    archived_date: None,
+                };
                 state.active_tasks.push(task);
+                drop(state);
+                let mut index = self.task_index.write().await;
+                index.insert(entry.id.clone(), entry);
                 self.context_ok.store(true, Ordering::Release);
             }
 
@@ -475,6 +525,7 @@ impl StateManager {
             &self.state,
             &self.decisions,
             &self.traps,
+            &self.task_index,
             &root,
             &self.context_ok,
             &self.decisions_ok,
@@ -519,6 +570,116 @@ impl StateManager {
 }
 
 // ── Free functions ─────────────────────────────────────────────────────────
+
+/// Build a TaskIndex from active_tasks, done_tasks, and tasks_archive.md.
+async fn build_task_index(
+    state: &RuntimeState,
+    project_root: &std::path::Path,
+) -> HashMap<String, TaskIndexEntry> {
+    let mut index = HashMap::new();
+
+    // 1. Active tasks
+    for t in &state.active_tasks {
+        index.insert(
+            t.id.clone(),
+            TaskIndexEntry {
+                id: t.id.clone(),
+                status: t.status.clone(),
+                description: t.description.clone(),
+                location: TaskLocation::Active,
+                superseded_by: t.superseded_by.clone(),
+                archived_date: None,
+            },
+        );
+    }
+
+    // 2. Done tasks (pending flush to archive)
+    for t in &state.done_tasks {
+        index.insert(
+            t.id.clone(),
+            TaskIndexEntry {
+                id: t.id.clone(),
+                status: t.status.clone(),
+                description: t.description.clone(),
+                location: TaskLocation::DoneQueue,
+                superseded_by: t.superseded_by.clone(),
+                archived_date: None,
+            },
+        );
+    }
+
+    // 3. Archived tasks (from tasks_archive.md)
+    let archive_path = project_root.join("memory/tasks_archive.md");
+    if let Ok(content) = tokio::fs::read_to_string(&archive_path).await {
+        let re = regex::Regex::new(r"^-\s*\[(Done|Superseded|Cancelled)\]\s*\[(TASK-\d{3})\]\s*(.*)").unwrap();
+        let mut current_date: Option<String> = None;
+        let mut last_task_id: Option<String> = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Capture date header: ### 2026-06-05
+            if let Some(date) = trimmed.strip_prefix("### ") {
+                current_date = Some(date.to_string());
+                continue;
+            }
+
+            // Capture task line
+            if let Some(caps) = re.captures(trimmed) {
+                let status_str = &caps[1];
+                let id = caps[2].to_string();
+                let desc = caps[3].trim().to_string();
+                let status = match status_str {
+                    "Done" => TaskStatus::Done,
+                    "Superseded" => TaskStatus::Superseded,
+                    "Cancelled" => TaskStatus::Cancelled,
+                    _ => TaskStatus::Done,
+                };
+
+                let mut entry = TaskIndexEntry {
+                    id: id.clone(),
+                    status,
+                    description: desc,
+                    location: TaskLocation::Archived,
+                    superseded_by: None,
+                    archived_date: current_date.clone(),
+                };
+
+                last_task_id = Some(id.clone());
+                index.insert(id, entry);
+                continue;
+            }
+
+            // Capture Superseded metadata for the last task
+            if let Some(id) = &last_task_id {
+                if let Some(entry) = index.get_mut(id) {
+                    if trimmed.starts_with("Superseded by:") {
+                        let rest = trimmed["Superseded by:".len()..].trim();
+                        // Parse "ADR-053" or "Task TASK-015"
+                        if rest.starts_with("ADR-") {
+                            entry.superseded_by = Some(SupersededInfo {
+                                reference: Reference::Adr(rest.to_string()),
+                                reason: String::new(),
+                            });
+                        } else if rest.starts_with("Task ") {
+                            entry.superseded_by = Some(SupersededInfo {
+                                reference: Reference::Task(rest["Task ".len()..].to_string()),
+                                reason: String::new(),
+                            });
+                        }
+                    } else if trimmed.starts_with("Reason:") {
+                        let reason = trimmed["Reason:".len()..].trim().to_string();
+                        if let Some(ref mut info) = entry.superseded_by {
+                            info.reason = reason;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    index
+}
 
 /// Loaded runtime state from disk, with per-file parse-success flags.
 struct LoadedFiles {
@@ -753,6 +914,7 @@ async fn flush_inner(
     state: &Arc<RwLock<RuntimeState>>,
     decisions: &Arc<RwLock<Vec<ADR>>>,
     traps: &Arc<RwLock<Vec<Trap>>>,
+    task_index: &Arc<RwLock<HashMap<String, TaskIndexEntry>>>,
     project_root: &Path,
     context_ok: &AtomicBool,
     decisions_ok: &AtomicBool,
@@ -888,6 +1050,15 @@ async fn flush_inner(
             }
 
             // Clear done_tasks so they are not archived again.
+            // Update TaskIndex: DoneQueue → Archived
+            let today_str = today.clone();
+            for task in &s.done_tasks {
+                let mut index = task_index.write().await;
+                if let Some(entry) = index.get_mut(&task.id) {
+                    entry.location = TaskLocation::Archived;
+                    entry.archived_date = Some(today_str.clone());
+                }
+            }
             s.done_tasks.clear();
         }
     }
@@ -1873,5 +2044,93 @@ old dec
             !archive_path.exists(),
             "tasks_archive.md should not be created when no Done tasks exist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_task_index_built_at_bootstrap() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        // Create a task.
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-001".into(),
+            description: "Test task".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
+        .await
+        .unwrap();
+
+        // Verify task_index contains the active task.
+        let index = mgr.task_index.read().await;
+        let entry = index.get("TASK-001").expect("TASK-001 should be in index");
+        assert_eq!(entry.status, TaskStatus::Todo);
+        assert!(matches!(entry.location, TaskLocation::Active));
+    }
+
+    #[tokio::test]
+    async fn test_task_index_updates_on_terminal() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-002".into(),
+            description: "Test task".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
+        .await
+        .unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-002".into(),
+            new_status: TaskStatus::Done,
+            superseded_by: None,
+        })
+        .await
+        .unwrap();
+
+        let index = mgr.task_index.read().await;
+        let entry = index.get("TASK-002").expect("TASK-002 should be in index");
+        assert_eq!(entry.status, TaskStatus::Done);
+        assert!(matches!(entry.location, TaskLocation::DoneQueue));
+    }
+
+    #[tokio::test]
+    async fn test_memory_health() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        let health = mgr.memory_health().await;
+        assert_eq!(health.adr_count, 0);
+        assert_eq!(health.active_tasks, 0);
+        assert_eq!(health.done_tasks, 0);
+        assert_eq!(health.traps, 0);
+
+        // Add one task and one ADR.
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-003".into(),
+            description: "Test".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
+        .await
+        .unwrap();
+
+        mgr.apply_event(RuntimeEvent::AdrCommitted(ADR {
+            id: "ADR-001".into(),
+            title: "Test".into(),
+            status: AdrStatus::Accepted,
+            context: "ctx".into(),
+            decision: "dec".into(),
+            tags: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let health = mgr.memory_health().await;
+        assert_eq!(health.adr_count, 1);
+        assert_eq!(health.active_tasks, 1);
+        assert_eq!(health.traps, 0);
     }
 }

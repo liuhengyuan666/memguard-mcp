@@ -157,6 +157,37 @@ pub enum RuntimeEvent {
     PhaseChanged(String),
 }
 
+// ── TaskIndex (v0.5.0) ─────────────────────────────────────────────────────
+
+/// Location of a task within the memory system.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TaskLocation {
+    Active,
+    DoneQueue,
+    Archived,
+    Unknown,
+}
+
+/// O(1) lookup entry for a task, built at bootstrap and kept in sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskIndexEntry {
+    pub id: String,
+    pub status: TaskStatus,
+    pub description: String,
+    pub location: TaskLocation,
+    pub superseded_by: Option<SupersededInfo>,
+    pub archived_date: Option<String>,
+}
+
+/// Health snapshot returned by bootstrap to help the agent gauge project maturity.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryHealth {
+    pub adr_count: usize,
+    pub active_tasks: usize,
+    pub done_tasks: usize,
+    pub traps: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
