@@ -151,9 +151,9 @@ pub fn render_context(state: &RuntimeState) -> String {
 /// Parses lines matching `- [Done] [<id>]` and collects the IDs into a
 /// HashSet so callers can globally deduplicate across all date sections.
 fn extract_task_ids(md: &str) -> HashSet<String> {
-    let re = Regex::new(r"^-\s*\[Done\]\s*\[([A-Za-z0-9_-]+)\]").unwrap();
+    let re = Regex::new(r"^-\s*\[(Done|Superseded|Cancelled)\]\s*\[([A-Za-z0-9_-]+)\]").unwrap();
     md.lines()
-        .filter_map(|line| re.captures(line).map(|cap| cap[1].to_string()))
+        .filter_map(|line| re.captures(line).map(|cap| cap[2].to_string()))
         .collect()
 }
 

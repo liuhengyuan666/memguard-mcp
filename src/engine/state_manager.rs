@@ -193,7 +193,7 @@ impl StateManager {
             decisions,
             traps,
             project_root: root,
-            task_index: Arc::new(RwLock::new(HashMap::new())),
+            task_index,
             flush_generation,
             flush_tx,
             context_ok,
@@ -244,6 +244,14 @@ impl StateManager {
             *s = loaded.state;
             *d = loaded.decisions;
             *t = loaded.traps;
+        }
+
+        // 5.5 Rebuild TaskIndex for the new project (clear + rebuild).
+        {
+            let mut index = self.task_index.write().await;
+            index.clear();
+            let state = self.state.read().await;
+            *index = build_task_index(&state, &project_root).await;
         }
 
         // Track parse success for flush guard.
@@ -611,7 +619,7 @@ async fn build_task_index(
     // 3. Archived tasks (from tasks_archive.md)
     let archive_path = project_root.join("memory/tasks_archive.md");
     if let Ok(content) = tokio::fs::read_to_string(&archive_path).await {
-        let re = regex::Regex::new(r"^-\s*\[(Done|Superseded|Cancelled)\]\s*\[(TASK-\d{3})\]\s*(.*)").unwrap();
+        let re = regex::Regex::new(r"^-\s*\[(Done|Superseded|Cancelled)\]\s*\[([A-Za-z0-9_-]+)\]\s*(.*)").unwrap();
         let mut current_date: Option<String> = None;
         let mut last_task_id: Option<String> = None;
 
@@ -2132,5 +2140,86 @@ old dec
         assert_eq!(health.adr_count, 1);
         assert_eq!(health.active_tasks, 1);
         assert_eq!(health.traps, 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_index_after_flush() {
+        let (_dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-004".into(),
+            description: "Flush test".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
+        .await
+        .unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-004".into(),
+            new_status: TaskStatus::Done,
+            superseded_by: None,
+        })
+        .await
+        .unwrap();
+
+        // Before flush: location should be DoneQueue
+        {
+            let index = mgr.task_index.read().await;
+            let entry = index.get("TASK-004").unwrap();
+            assert!(matches!(entry.location, TaskLocation::DoneQueue));
+            assert!(entry.archived_date.is_none());
+        }
+
+        // Flush writes archive and updates TaskIndex
+        mgr.flush_now().await.unwrap();
+
+        // After flush: location should be Archived with date
+        {
+            let index = mgr.task_index.read().await;
+            let entry = index.get("TASK-004").unwrap();
+            assert!(matches!(entry.location, TaskLocation::Archived));
+            assert!(entry.archived_date.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_index_rebuild_after_cache_delete() {
+        let (dir, mgr) = setup_temp_dir();
+        mgr.bootstrap().await.unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskCreated(Task {
+            id: "TASK-005".into(),
+            description: "Cache rebuild test".into(),
+            status: TaskStatus::Todo,
+            superseded_by: None,
+        }))
+        .await
+        .unwrap();
+
+        mgr.apply_event(RuntimeEvent::TaskUpdated {
+            task_id: "TASK-005".into(),
+            new_status: TaskStatus::Done,
+            superseded_by: None,
+        })
+        .await
+        .unwrap();
+
+        mgr.flush_now().await.unwrap();
+
+        // Delete .memguard/ cache
+        let memguard_dir = dir.path().join(".memguard");
+        tokio::fs::remove_dir_all(&memguard_dir).await.unwrap();
+        assert!(!memguard_dir.exists());
+
+        // Re-bootstrap should rebuild TaskIndex from memory/*.md
+        mgr.bootstrap().await.unwrap();
+
+        let index = mgr.task_index.read().await;
+        let entry = index.get("TASK-005").expect("TASK-005 should be rebuilt from archive");
+        assert_eq!(entry.status, TaskStatus::Done);
+        assert!(matches!(entry.location, TaskLocation::Archived));
+        assert!(entry.archived_date.is_some());
     }
 }
