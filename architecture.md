@@ -1,7 +1,7 @@
 # MemGuard v3 — Architecture & Design Reference
 
 > **Runtime**: Rust MCP Server · Git-native · RwLock thread-safe · Source-of-Truth in Markdown
-> **Version**: 0.4.0 (core) / 4.1.0 (spec)
+> **Version**: 0.5.0 (core) / 4.2.0 (spec)
 > **Compatibility**: OpenCode MCP client
 
 ---
