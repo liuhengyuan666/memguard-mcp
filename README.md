@@ -7,7 +7,7 @@
 > **The Muscle for MemGuard v4.**
 > A Git-Native, thread-safe Model Context Protocol (MCP) server written in Rust.
 
-`MemGuard MCP` is the capability engine behind the MemGuard v4 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees. V4 introduces full lifecycle management: automatic archival of completed tasks, ADR state machine with 5 statuses, a Validation Framework, and an inverted search index.
+`MemGuard MCP` is the capability engine behind the MemGuard v4 architecture. It manages the physical reading, concurrent writing, validation guarding, and semantic indexing of your agent's memory trees. V4 introduces full lifecycle management: automatic archival of completed tasks, ADR state machine with 5 statuses, a Validation Framework, and an inverted search index. V0.5.0 adds TaskIndex for O(1) task lookup, `runtime_task_lookup` tool, and Bootstrap Health metrics.
 
 ⚠️ **Crucial Requirement:** This is the execution runtime. To govern *when* and *how* the agent calls these tools, you **must** install the companion behavioral contract: [memguard Core Specification](https://github.com/liuhengyuan666/memguard).
 
@@ -19,9 +19,11 @@
 - **500ms Write Debouncing**: Groups aggressive, high-frequency agent thought logs into atomic file writes, mitigating disk I/O chokepoints.
 - **Phase Canonicalization**: Normalizes Chinese (`执行模式`), verbose English (`planning`), and legacy phase strings to SOP-canonical short identifiers (`explore`, `plan`, `implement`, `verify`, `complete`), ensuring agent mode-switching logic is never broken by non-standard phase names.
 - **ADR-Driven Continuity**: Bootstrap output surfaces `adr_count` and `trap_count` signals, ordering architectural decisions and constraints before task lists so agents prioritize project continuity over task management.
-- **Task Lifecycle Management**: Done tasks are automatically archived to `tasks_archive.md`; Blocked status tracks externally-blocked work.
+- **Task Lifecycle Management**: 6 statuses (`Todo` → `InProgress` → `Blocked` → `Done`/`Superseded`/`Cancelled`) with terminal auto-archive to `tasks_archive.md` (Completed/Superseded/Cancelled sections).
 - **ADR State Machine**: 5 statuses (`Proposed` → `Accepted` → `Superseded`/`Archived`, `Rejected` → `Proposed`) with transition validation.
-- **Validation Framework**: Pre-mutation validation via `ValidatorRegistry` with 5 concrete validators (duplicate task ID, empty ID, ADR conflict, rejected repeat, invalid transition).
+- **Validation Framework**: Pre-mutation validation via `ValidatorRegistry` with 7 concrete validators (duplicate task ID, empty ID, ADR conflict, rejected repeat, invalid transition, task terminal transition, superseded-by required).
+- **TaskIndex & Task Lookup (v0.5.0)**: O(1) task ID lookup across active, done, and archived tasks via `runtime_task_lookup`. Eliminates ambiguous "Task not found" errors.
+- **Bootstrap Health (v0.5.0)**: `runtime_bootstrap` returns `memory_health` snapshot (ADR/task/trap counts) so agents gauge project maturity at a glance.
 - **Inverted Search Index**: O(1) term-based pre-filtering for `query_memory` with behavioral parity to the legacy brute-force scorer.
 - **Manual Cleanup CLI**: `memguard cleanup --dry-run` scans memory for hygiene issues (stale ADRs, done tasks, duplicates) with backup + interactive confirmation.
 
@@ -51,13 +53,14 @@ The optimized binary will be at `target/release/memguard-mcp` (Linux/macOS) or `
 
 ## 🔌 Protocol Tool Specifications
 
-Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 3 atomic capabilities to your LLM/Agent environment:
+Once mounted via JSON-RPC over Stdio, `memguard-mcp` exposes 4 atomic capabilities to your LLM/Agent environment:
 
 | Tool | Function | Key Parameters |
 |---|---|---|
 | `runtime_bootstrap` | Reads `memory/*.md`, rebuilds cache, returns summary with phase, constraints, `adr_count`/`trap_count`, latest ADR, active tasks (in priority order) | `project_root` (optional) |
 | `runtime_commit_event` | Unified state change entrypoint: TaskUpdated / AdrCommitted / TrapRecorded / PhaseChanged (phase names are auto-canonicalized) | `event_type` + `payload` |
 | `runtime_query_memory` | Keyword search over decisions and traps | `query_intent` (required), `limit` (optional, default 3) |
+| `runtime_task_lookup` | Look up a task by ID across active, done, and archived sources (v0.5.0) | `task_id` (required) |
 
 > Agent **should not** call these tools directly — the Skill layer (SKILL.md) tells the Agent *when* to invoke them. See the companion [memguard Skill](https://github.com/liuhengyuan666/memguard) for the SOP.
 
@@ -126,7 +129,7 @@ gets them wrong.
 
 **Fix**: Install the Skill (above), then restart the session. With the Skill
 installed, the Agent follows the SOP and uses correct payload fields:
-- `TaskUpdated`: use `task_id` + `new_status` (values: `Todo` | `InProgress` | `Blocked` | `Done`)
+- `TaskUpdated`: use `task_id` + `new_status` (values: `Todo` | `InProgress` | `Blocked` | `Done` | `Superseded` | `Cancelled`)
 - `AdrCommitted`: include all 6 fields (`id`, `title`, `status`, `context`, `decision`, `tags`). `status` accepts `Proposed`, `Accepted`, `Superseded`, `Rejected`, `Archived` (legacy `"active"` maps to `Accepted` for backward compatibility)
 
 ### MCP returns `MCP error -32602: Invalid ADR payload`
