@@ -288,7 +288,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.5.0"
+                "version": "0.5.1"
             }
         }))
     }
@@ -491,6 +491,8 @@ impl McpServer {
                     "trap_count": trap_count,
                     "memory_health": health,
                     "active_tasks": tasks,
+                    "memguard_version": env!("CARGO_PKG_VERSION"),
+                    "schema_version": "1",
                 })).unwrap_or_default()
             }]
         }))

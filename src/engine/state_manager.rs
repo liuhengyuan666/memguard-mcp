@@ -359,15 +359,58 @@ impl StateManager {
     }
 
     /// Compute a MemoryHealth snapshot from current state.
+    ///
+    /// Also verifies the integrity of `.memguard/` cache files on disk so the
+    /// agent receives a `cache_status` signal (`Healthy`, `RebuildRequired`,
+    /// or `Corrupted`).
     pub async fn memory_health(&self) -> MemoryHealth {
         let decisions = self.decisions.read().await;
         let state = self.state.read().await;
         let traps = self.traps.read().await;
+
+        let cache_status = self.compute_cache_status().await;
+
         MemoryHealth {
             adr_count: decisions.len(),
             active_tasks: state.active_tasks.len(),
             done_tasks: state.done_tasks.len(),
             traps: traps.len(),
+            cache_status,
+        }
+    }
+
+    /// Inspect `.memguard/runtime_state.json` and `.memguard/search_index.json`
+    /// to determine whether the cache is healthy, missing, or corrupted.
+    async fn compute_cache_status(&self) -> CacheStatus {
+        let project_root = self.project_root.read().await.clone();
+        let memguard_dir = project_root.join(".memguard");
+        let runtime_path = memguard_dir.join("runtime_state.json");
+        let index_path = memguard_dir.join("search_index.json");
+
+        let runtime_exists = tokio::fs::try_exists(&runtime_path).await.unwrap_or(false);
+        let index_exists = tokio::fs::try_exists(&index_path).await.unwrap_or(false);
+
+        if !runtime_exists || !index_exists {
+            return CacheStatus::RebuildRequired;
+        }
+
+        // Try to parse both files. If either fails, the cache is corrupted.
+        let runtime_ok = tokio::fs::read_to_string(&runtime_path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<RuntimeState>(&s).ok())
+            .is_some();
+
+        let index_ok = tokio::fs::read_to_string(&index_path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some();
+
+        if runtime_ok && index_ok {
+            CacheStatus::Healthy
+        } else {
+            CacheStatus::Corrupted
         }
     }
 

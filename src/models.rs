@@ -179,6 +179,16 @@ pub struct TaskIndexEntry {
     pub archived_date: Option<String>,
 }
 
+/// Cache health indicator returned by bootstrap so the agent knows whether
+/// it can trust the cached memory state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum CacheStatus {
+    #[default]
+    Healthy,
+    RebuildRequired,
+    Corrupted,
+}
+
 /// Health snapshot returned by bootstrap to help the agent gauge project maturity.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryHealth {
@@ -186,6 +196,7 @@ pub struct MemoryHealth {
     pub active_tasks: usize,
     pub done_tasks: usize,
     pub traps: usize,
+    pub cache_status: CacheStatus,
 }
 
 #[cfg(test)]
