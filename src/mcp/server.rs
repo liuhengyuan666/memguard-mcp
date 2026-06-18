@@ -288,7 +288,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "memguard-mcp",
-                "version": "0.5.1"
+                "version": "0.6.0"
             }
         }))
     }
@@ -511,7 +511,73 @@ impl McpServer {
             .get("payload")
             .ok_or_else(|| McpError::InvalidParams("Missing payload".into()))?;
 
-        let event = parse_event(event_type, payload)?;
+        let event = match parse_event(event_type, payload) {
+            Ok(e) => e,
+            Err(e) => {
+                let (required_fields, example) = match event_type {
+                    "TaskUpdated" => (
+                        vec!["task_id", "new_status"],
+                        serde_json::json!({
+                            "task_id": "TASK-001",
+                            "new_status": "Done"
+                        }),
+                    ),
+                    "TaskCreated" => (
+                        vec!["id"],
+                        serde_json::json!({
+                            "id": "TASK-001",
+                            "title": "Short description",
+                            "description": "Longer description"
+                        }),
+                    ),
+                    "AdrCommitted" => (
+                        vec!["id", "title", "status"],
+                        serde_json::json!({
+                            "id": "ADR-001",
+                            "title": "Decision title",
+                            "status": "Proposed",
+                            "context": "Background context",
+                            "decision": "What was decided",
+                            "tags": ["architecture"]
+                        }),
+                    ),
+                    "TrapRecorded" => (
+                        vec!["error_signature", "solution"],
+                        serde_json::json!({
+                            "id": "TRAP-001",
+                            "title": "Error title",
+                            "context": "When it happened",
+                            "error_signature": "Error message pattern",
+                            "solution": "How to fix it",
+                            "tags": ["bug"]
+                        }),
+                    ),
+                    "PhaseChanged" => (
+                        vec!["new_phase"],
+                        serde_json::json!({
+                            "new_phase": "explore"
+                        }),
+                    ),
+                    _ => (vec![], serde_json::json!({})),
+                };
+
+                let error_json = serde_json::json!({
+                    "error": "Invalid payload",
+                    "event_type": event_type,
+                    "required_fields": required_fields,
+                    "example": example,
+                    "original_error": e.to_string()
+                });
+
+                return Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&error_json).unwrap_or_default()
+                    }],
+                    "isError": true
+                }));
+            }
+        };
 
         match self.state_manager.apply_event(event).await {
             Ok(()) => Ok(serde_json::json!({
